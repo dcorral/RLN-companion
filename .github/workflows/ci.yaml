@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # UTEXO-Protocol/rgb-lightning-node dev commit the companion was validated against
+  RLN_REF: db194f761e12f6d1fbd808121e1b9d65a3b304e7
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rln-companion
+      - uses: actions/checkout@v4
+        with:
+          repository: UTEXO-Protocol/rgb-lightning-node
+          ref: ${{ env.RLN_REF }}
+          path: rgb-lightning-node/dev
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rln-companion
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rgb-lightning-node/dev
+          key: rln-${{ env.RLN_REF }}
+      - name: Build rgb-lightning-node
+        working-directory: rgb-lightning-node/dev
+        run: cargo build
+      - name: Regtest e2e
+        working-directory: rln-companion
+        run: RLN_BIN=$GITHUB_WORKSPACE/rgb-lightning-node/dev/target/debug/rgb-lightning-node ./e2e/run.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-node-logs
+          path: rln-companion/e2e-tmp/**/*.out
+          if-no-files-found: ignore
+
+  # Both images are built from source, so this job is slow: the RLN build only
+  # benefits from Docker's own build cache on the runner. Consider
+  # docker/build-push-action with the GHA cache backend later.
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rln-companion
+      - uses: actions/checkout@v4
+        with:
+          repository: UTEXO-Protocol/rgb-lightning-node
+          ref: ${{ env.RLN_REF }}
+          path: rgb-lightning-node/dev
+          submodules: recursive
+      - name: Write companion config
+        working-directory: rln-companion
+        run: |
+          cp deploy/companion.toml.example deploy/companion.toml
+          sed -i 's#https://REPLACE_ME/hook#http://127.0.0.1:9/hook#; s#"REPLACE_ME"#"ci-secret"#' deploy/companion.toml
+      - name: Compose up
+        working-directory: rln-companion
+        run: RLN_SRC=$GITHUB_WORKSPACE/rgb-lightning-node/dev docker compose -f deploy/compose.yaml up --build --wait
+      - name: Companion serves and node is locked
+        run: |
+          for _ in $(seq 1 30); do
+            body=$(curl -fs 127.0.0.1:3101/companion/health || true)
+            case "$body" in *'"node":"locked"'*) exit 0 ;; esac
+            sleep 2
+          done
+          echo "health never reported a locked node; last body: $body"
+          exit 1
+      - name: Node API port is not published
+        working-directory: rln-companion
+        run: '! docker compose -f deploy/compose.yaml port rln 3001'
+      - name: Compose logs
+        if: failure()
+        working-directory: rln-companion
+        run: docker compose -f deploy/compose.yaml logs
+      - name: Compose down
+        if: always()
+        working-directory: rln-companion
+        run: docker compose -f deploy/compose.yaml down -v

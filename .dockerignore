@@ -1,0 +1,7 @@
+target
+e2e-tmp
+e2e/datacore
+e2e/dataindex
+*.sqlite*
+.git
+deploy

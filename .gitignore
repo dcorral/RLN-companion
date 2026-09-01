@@ -1,0 +1,6 @@
+/target
+*.sqlite*
+/e2e-tmp
+/e2e/datacore
+/e2e/dataindex
+/deploy/companion.toml

@@ -1,0 +1,37 @@
+services:
+  rln:
+    build:
+      context: ${RLN_SRC:-../../rgb-lightning-node/dev}
+    command: ["/data", "--daemon-listening-port", "3001", "--ldk-peer-listening-port", "9735", "--network", "${RLN_NETWORK:-testnet}", "--disable-authentication"]
+    volumes:
+      - rln-data:/data
+    ports:
+      - "9735:9735"
+    networks: [internal]
+    restart: unless-stopped
+
+  companion:
+    build:
+      context: ..
+    command: ["--config", "/etc/rln-companion/config.toml"]
+    volumes:
+      - ./companion.toml:/etc/rln-companion/config.toml:ro
+      - companion-data:/var/lib/rln-companion
+    ports:
+      - "${COMPANION_BIND:-127.0.0.1}:${COMPANION_PORT:-3101}:3101"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:3101/companion/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    depends_on: [rln]
+    networks: [internal]
+    restart: unless-stopped
+
+networks:
+  internal:
+
+volumes:
+  rln-data:
+  companion-data:

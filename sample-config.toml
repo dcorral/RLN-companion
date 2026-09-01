@@ -1,0 +1,55 @@
+[service]
+# port the companion API listens on
+listen_port = 3101
+# bearer token required on companion API calls; unset means no auth
+#auth_token = ""
+
+[rln]
+# base URL of the RLN node API; must be private unless allow_public_url is set
+base_url = "http://127.0.0.1:3001"
+# bearer token sent to RLN; unset means none
+#token = ""
+# timeout for companion-initiated RLN calls
+request_timeout_secs = 120
+# timeout for proxied client calls to RLN
+proxy_timeout_secs = 600
+# maximum proxied request body size in MiB; larger bodies get 413
+proxy_max_body_mb = 64
+# allow a non-private RLN host
+allow_public_url = false
+
+[engine]
+# how often /refreshtransfers is driven while transfers are pending
+refresh_interval_secs = 10
+# skip the wallet sync inside RLN's refresh; keep false when witness receives are used
+skip_sync = false
+# how often expired tracked transfers are failed via /failtransfers
+reap_interval_secs = 300
+# wait between reconcile attempts while the node is locked or unreachable
+reconcile_backoff_secs = 5
+# maximum wait before a reconcile attempt is given up
+reconcile_max_wait_secs = 600
+
+[sync]
+# how often a full transfer sync from RLN runs
+full_interval_secs = 600
+# page size for RLN list calls (full syncs use at least 1000)
+page_size = 100
+
+[webhook]
+# operator endpoint receiving transfer events; required
+url = ""
+# HMAC secret used to sign webhook deliveries; required
+secret = ""
+# deliveries are parked after this many failed attempts and surface as parked_events in health; they are not retried automatically
+max_attempts = 10
+# base of the exponential retry backoff
+backoff_base_secs = 2
+# cap of the exponential retry backoff
+backoff_cap_secs = 300
+# how often pending webhooks are dispatched
+dispatch_interval_secs = 2
+
+[database]
+# SQLite database file
+path = "companion.sqlite"

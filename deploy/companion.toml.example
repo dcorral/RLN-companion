@@ -1,0 +1,15 @@
+[service]
+listen_port = 3101
+
+[rln]
+# compose service name of the node; only reachable on the internal network
+base_url = "http://rln:3001"
+
+[database]
+path = "/var/lib/rln-companion/companion.sqlite"
+
+[webhook]
+# your endpoint receiving transfer events
+url = "https://REPLACE_ME/hook"
+# HMAC secret used to sign deliveries; verify it on your side
+secret = "REPLACE_ME"
