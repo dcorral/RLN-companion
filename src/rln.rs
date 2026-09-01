@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use reqwest::RequestBuilder;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -76,6 +74,11 @@ pub struct FailTransfersResponse {
 }
 
 #[derive(Deserialize)]
+pub struct NetworkInfoResponse {
+    pub network: String,
+}
+
+#[derive(Deserialize)]
 pub struct RlnErrorBody {
     pub error: String,
     pub code: u16,
@@ -113,6 +116,7 @@ pub trait RlnApi: Send + Sync {
     async fn list_assets(&self) -> Result<Vec<(String, String)>, RlnError>;
     async fn fail_transfer(&self, batch_transfer_idx: i32) -> Result<(), RlnError>;
     async fn node_info(&self) -> Result<serde_json::Value, RlnError>;
+    async fn network(&self) -> Result<String, RlnError>;
 }
 
 pub struct HttpRlnClient {
@@ -123,10 +127,10 @@ pub struct HttpRlnClient {
 
 impl HttpRlnClient {
     pub fn new(cfg: &config::Rln) -> Result<Self, RlnError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(cfg.request_timeout_secs))
-            .build()?;
+        let client = crate::http_client(
+            cfg.request_timeout_secs,
+            reqwest::redirect::Policy::default(),
+        )?;
         Ok(Self {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             client,
@@ -270,6 +274,11 @@ impl RlnApi for HttpRlnClient {
     async fn node_info(&self) -> Result<serde_json::Value, RlnError> {
         self.get("/nodeinfo").await
     }
+
+    async fn network(&self) -> Result<String, RlnError> {
+        let resp: NetworkInfoResponse = self.get("/networkinfo").await?;
+        Ok(resp.network)
+    }
 }
 
 #[cfg(test)]
@@ -287,18 +296,23 @@ pub mod test_support {
         Transport,
         CannotFail,
         Api,
+        Unauthorized,
+        Forbidden,
     }
 
     impl MockFailure {
         fn into_error(self) -> RlnError {
+            let api = |code, name: &str| RlnError::Api {
+                code,
+                name: name.into(),
+                message: "boom".into(),
+            };
             match self {
                 Self::Locked => RlnError::Locked,
                 Self::CannotFail => RlnError::CannotFail,
-                Self::Api => RlnError::Api {
-                    code: 500,
-                    name: "Internal".into(),
-                    message: "boom".into(),
-                },
+                Self::Api => api(500, "Internal"),
+                Self::Unauthorized => api(401, "Unauthorized"),
+                Self::Forbidden => api(403, "Forbidden"),
                 Self::Transport => RlnError::Transport(
                     reqwest::Client::new()
                         .get("::not a url::")
@@ -309,7 +323,16 @@ pub mod test_support {
         }
     }
 
-    #[derive(Default)]
+    pub async fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("condition not met within 1s");
+    }
+
     pub struct MockRln {
         pub transfers: Mutex<HashMap<String, Vec<RlnTransfer>>>,
         pub assets: Mutex<Vec<(String, String)>>,
@@ -317,6 +340,21 @@ pub mod test_support {
         pub fail_call: Mutex<Option<(String, MockFailure)>>,
         pub calls: Mutex<Vec<String>>,
         pub page_sizes: Mutex<Vec<u64>>,
+        pub network: Mutex<String>,
+    }
+
+    impl Default for MockRln {
+        fn default() -> Self {
+            Self {
+                transfers: Mutex::default(),
+                assets: Mutex::default(),
+                fail_with: Mutex::default(),
+                fail_call: Mutex::default(),
+                calls: Mutex::default(),
+                page_sizes: Mutex::default(),
+                network: Mutex::new("Regtest".into()),
+            }
+        }
     }
 
     impl MockRln {
@@ -414,6 +452,11 @@ pub mod test_support {
         async fn node_info(&self) -> Result<serde_json::Value, RlnError> {
             self.record("node_info".into())?;
             Ok(serde_json::json!({}))
+        }
+
+        async fn network(&self) -> Result<String, RlnError> {
+            self.record("network".into())?;
+            Ok(self.network.lock().unwrap().clone())
         }
     }
 }
@@ -727,6 +770,22 @@ mod tests {
             .await;
 
         client(&server, None).node_info().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_reads_networkinfo() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/networkinfo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "network": "Regtest", "height": 12 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(client(&server, None).network().await.unwrap(), "Regtest");
     }
 
     #[tokio::test]

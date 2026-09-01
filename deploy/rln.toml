@@ -1,0 +1,18 @@
+# Node config mounted at /etc/rln/config.toml by compose.yaml. This is RLN's own
+# config format: any key from RLN's sample-config.toml can be added here.
+
+[node]
+network = "Testnet"
+daemon_listening_port = 3001
+ldk_peer_listening_port = 9735
+
+[auth]
+disable_authentication = true
+# to switch to Biscuit auth set this and disable_authentication = false (see README)
+#root_public_key = ""
+
+[chain]
+# when set, /unlock does not need to send indexer_url
+#indexer_url = ""
+# when set, /unlock does not need to send proxy_endpoint
+#proxy_endpoint = ""

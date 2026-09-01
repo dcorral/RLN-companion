@@ -56,6 +56,7 @@ impl Default for Service {
 pub struct Rln {
     pub base_url: String,
     pub token: Option<String>,
+    pub network: Option<String>,
     pub request_timeout_secs: u64,
     pub proxy_timeout_secs: u64,
     pub proxy_max_body_mb: u64,
@@ -67,6 +68,7 @@ impl Default for Rln {
         Self {
             base_url: "http://127.0.0.1:3001".into(),
             token: None,
+            network: None,
             request_timeout_secs: 120,
             proxy_timeout_secs: 600,
             proxy_max_body_mb: 64,

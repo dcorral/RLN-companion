@@ -9,7 +9,18 @@ pub mod store;
 pub mod sync;
 pub mod webhook;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub(crate) fn http_client(
+    timeout_secs: u64,
+    redirect: reqwest::redirect::Policy,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirect(redirect)
+        .build()
+}
 
 pub fn now() -> i64 {
     SystemTime::now()

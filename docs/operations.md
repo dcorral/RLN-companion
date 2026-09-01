@@ -2,13 +2,21 @@
 
 ## Startup
 
-The companion probes the node once (a rejected `rln.token` is fatal; a locked or unreachable node is not), binds and serves right away, and runs a reconcile in the background: a full sync of assets and transfers, retried while the node is locked or unreachable for up to `engine.reconcile_max_wait_secs`. A fresh node can be initialised and unlocked through the companion while that wait is going on.
+The companion probes the node once (a misconfigured node is fatal; a locked or unreachable node is not), binds and serves right away, and runs a reconcile in the background: a full sync of assets and transfers, retried while the node is locked or unreachable for up to `engine.reconcile_max_wait_secs`. A fresh node can be initialised and unlocked through the companion while that wait is going on.
+
+The probe calls `/nodeinfo` and, when `rln.network` is set and the node is unlocked, `/networkinfo`. It validates that the node accepts the companion's token and that the node runs the expected network. Fatal lines an operator can hit at startup, all prefixed with `node misconfigured: `:
+
+- `node requires a Biscuit token: set rln.token` -> the node answered 401; it runs with Biscuit auth and `rln.token` is unset or invalid.
+- `rln.token lacks the rights the companion needs (admin, or custom with /refreshtransfers, /failtransfers, /listtransfers, /listassets, /nodeinfo, /networkinfo)` -> the node answered 403 Forbidden; the token is valid but its rights do not cover the companion's own calls.
+- `node network is Regtest, rln.network expects Testnet` -> the node reports a different network than configured; fix whichever side is wrong before the companion mirrors transfers from the wrong chain.
+
+A locked node cannot report its network, so the network mismatch is only fatal when the companion starts against a node that is already unlocked. In the common case (node locked at start, unlocked later through the companion) the first reconcile after the unlock runs the same check: on a mismatch it logs the line above at `error` level, marks the node `misconfigured` (`/companion/health` reports `node: misconfigured` and `status: degraded`) and returns without syncing. Every runtime re-probe repeats the check and keeps the state at `misconfigured` while the mismatch lasts. All background work pauses in that state, exactly as for a locked node. The companion does not exit; once the node or `rln.network` is fixed and the node reports the expected network again, the next re-probe flips the state back to `unlocked`.
 
 If the reconcile gives up, the mirror stays stale until the periodic full sync (`sync.full_interval_secs`) runs against an unlocked node, or `/unlock` goes through the companion, which triggers a reconcile immediately. The refresh loop itself only re-probes node state and syncs pending rows.
 
 ## Node state
 
-The companion tracks whether the node is `unknown`, `locked`, `unlocked` or `down` from the lifecycle routes it proxies and from 403 answers that reveal the state. While the node is not `unlocked`, all background work pauses and the node is re-probed on every refresh interval, so an outage of any length is recovered automatically once the node is back.
+The companion tracks whether the node is `unknown`, `locked`, `unlocked`, `down` or `misconfigured` from the lifecycle routes it proxies, from 403 answers that reveal the state and from the `rln.network` check. While the node is not `unlocked`, all background work pauses and the node is re-probed on every refresh interval, so an outage of any length is recovered automatically once the node is back.
 
 ## The single-flight lock
 

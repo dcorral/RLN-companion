@@ -27,8 +27,8 @@ pub fn interceptor_routes() -> Router<Arc<AppState>> {
         .route("/issueassetifa", post(|State(s), r| issue(s, r, "IFA")))
         .route("/inflate", post(inflate))
         .route("/assetlink", post(assetlink))
-        .route("/refreshtransfers", post(refreshtransfers))
-        .route("/failtransfers", post(failtransfers))
+        .route("/refreshtransfers", post(sync_pending))
+        .route("/failtransfers", post(sync_pending))
         .route("/init", post(lock))
         .route("/unlock", post(unlock))
         .route("/restore", post(lock))
@@ -236,19 +236,13 @@ async fn assetlink(State(state): State<Arc<AppState>>, req: Request) -> Response
     .await
 }
 
-async fn sync_pending_under(state: Arc<AppState>, _ex: Exchange) -> Result<(), HookError> {
-    state.engine.sync_pending_locked(now()).await?;
-    Ok(())
-}
-
-async fn refreshtransfers(State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn sync_pending(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let _g = state.engine.lock().await;
-    forward_then(&state, req, sync_pending_under).await
-}
-
-async fn failtransfers(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    let _g = state.engine.lock().await;
-    forward_then(&state, req, sync_pending_under).await
+    forward_then(&state, req, |state, _| async move {
+        state.engine.sync_pending_locked(now()).await?;
+        Ok(())
+    })
+    .await
 }
 
 async fn unlock(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -298,21 +292,15 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::app::test_state;
-    use crate::config;
-    use crate::proxy::{self, Proxy};
-    use crate::rln::test_support::MockRln;
+    use crate::app::test_state_at;
+    use crate::proxy;
+    use crate::rln::test_support::{wait_until, MockRln};
     use crate::store::{NewTransfer, NodeState, Transfer, TransferStatus};
     use TransferStatus::*;
 
     async fn harness(base_url: &str) -> (Arc<MockRln>, Arc<AppState>, Router) {
-        let cfg = config::Rln {
-            base_url: base_url.to_string(),
-            proxy_timeout_secs: 5,
-            ..Default::default()
-        };
-        let rln = Arc::new(MockRln::default());
-        let state = Arc::new(test_state(Proxy::new(&cfg).unwrap(), rln.clone()).await);
+        let (rln, state) = test_state_at(base_url).await;
+        let state = Arc::new(state);
         let app = interceptor_routes()
             .fallback(proxy::fallback)
             .with_state(state.clone());
@@ -539,13 +527,9 @@ mod tests {
             .insert_transfer(
                 &NewTransfer {
                     asset_id: Some(asset.into()),
-                    kind: None,
-                    status: WaitingCounterparty,
                     recipient_id: Some("r".into()),
-                    txid: None,
                     batch_transfer_idx: Some(7),
-                    invoice: None,
-                    expiration_timestamp: None,
+                    ..NewTransfer::with_status(WaitingCounterparty)
                 },
                 1,
             )
@@ -624,16 +608,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, upstream);
         (rln, state, body)
-    }
-
-    async fn wait_until(mut done: impl FnMut() -> bool) {
-        for _ in 0..200 {
-            if done() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("condition not met within 1s");
     }
 
     #[tokio::test]

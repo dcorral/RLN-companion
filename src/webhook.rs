@@ -40,11 +40,7 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(store: Store, cfg: config::Webhook) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let client = crate::http_client(30, reqwest::redirect::Policy::none())?;
         Ok(Self { store, client, cfg })
     }
 
@@ -122,8 +118,6 @@ impl Dispatcher {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -131,12 +125,6 @@ mod tests {
     use crate::store::{NewTransfer, OutboxEvent, Store, TransferStatus};
 
     const NOW: i64 = 1_000;
-
-    fn hmac_hex(key: &str, msg: &[u8]) -> String {
-        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
-        mac.update(msg);
-        hex::encode(mac.finalize().into_bytes())
-    }
 
     fn cfg(url: String) -> config::Webhook {
         config::Webhook {
@@ -151,19 +139,7 @@ mod tests {
 
     async fn seed(store: &Store, event_id: &str, payload: &str) {
         let t = store
-            .insert_transfer(
-                &NewTransfer {
-                    asset_id: None,
-                    kind: None,
-                    status: TransferStatus::Initiated,
-                    recipient_id: None,
-                    txid: None,
-                    batch_transfer_idx: None,
-                    invoice: None,
-                    expiration_timestamp: None,
-                },
-                NOW,
-            )
+            .insert_transfer(&NewTransfer::with_status(TransferStatus::Initiated), NOW)
             .await
             .unwrap();
         assert!(store
@@ -228,7 +204,7 @@ mod tests {
             .and(header("x-companion-event-id", "ev1"))
             .and(header(
                 "x-companion-signature",
-                hmac_hex("secret", payload.as_bytes()).as_str(),
+                signature("secret", payload.as_bytes()).as_str(),
             ))
             .and(body_json(
                 serde_json::from_str::<serde_json::Value>(payload).unwrap(),

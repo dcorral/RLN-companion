@@ -8,6 +8,7 @@ Config is a TOML file loaded with `--config <path>`. Every key has a default (`s
 | `service.auth_token` | unset | Bearer token required on `/companion/*` calls except health; unset means no auth |
 | `rln.base_url` | `http://127.0.0.1:3001` | Base URL of the RLN node API; must be private unless `allow_public_url` is set |
 | `rln.token` | unset | Bearer token the companion sends on its own RLN calls; unset means none |
+| `rln.network` | unset | Bitcoin network the node must report on `/networkinfo` (`Mainnet`, `Testnet`, `Testnet4`, `Signet`, `Regtest`, compared case-insensitively); checked on every successful probe, a mismatch is fatal at startup; unset means no check |
 | `rln.request_timeout_secs` | `120` | Timeout for companion-initiated RLN calls |
 | `rln.proxy_timeout_secs` | `600` | Timeout for proxied client calls to RLN |
 | `rln.proxy_max_body_mb` | `64` | Maximum proxied request body size in MiB; larger bodies get 413 |

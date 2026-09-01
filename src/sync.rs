@@ -339,13 +339,8 @@ mod tests {
         ) -> NewTransfer {
             NewTransfer {
                 asset_id: asset_id.map(str::to_string),
-                kind: None,
-                status,
                 recipient_id: recipient_id.map(str::to_string),
-                txid: None,
-                batch_transfer_idx: None,
-                invoice: None,
-                expiration_timestamp: None,
+                ..NewTransfer::with_status(status)
             }
         }
 

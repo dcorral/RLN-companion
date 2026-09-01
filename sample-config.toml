@@ -9,6 +9,8 @@ listen_port = 3101
 base_url = "http://127.0.0.1:3001"
 # bearer token sent to RLN; unset means none
 #token = ""
+# bitcoin network the node must report on /networkinfo (Mainnet, Testnet, Testnet4, Signet, Regtest); unset means no check
+#network = ""
 # timeout for companion-initiated RLN calls
 request_timeout_secs = 120
 # timeout for proxied client calls to RLN

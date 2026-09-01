@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -93,11 +92,7 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(cfg: &config::Rln) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(cfg.proxy_timeout_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let client = crate::http_client(cfg.proxy_timeout_secs, reqwest::redirect::Policy::none())?;
         let max_body = usize::try_from(cfg.proxy_max_body_mb.saturating_mul(1024 * 1024))
             .unwrap_or(usize::MAX);
         Ok(Self {
@@ -255,7 +250,7 @@ mod tests {
     use wiremock::{Match, Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::app::test_state;
+    use crate::app::{test_rln_cfg as cfg, test_state};
     use crate::config;
     use crate::rln::test_support::MockRln;
 
@@ -264,14 +259,6 @@ mod tests {
     impl Match for NoHeaders {
         fn matches(&self, req: &wiremock::Request) -> bool {
             self.0.iter().all(|h| !req.headers.contains_key(*h))
-        }
-    }
-
-    fn cfg(base_url: &str) -> config::Rln {
-        config::Rln {
-            base_url: base_url.to_string(),
-            proxy_timeout_secs: 5,
-            ..Default::default()
         }
     }
 

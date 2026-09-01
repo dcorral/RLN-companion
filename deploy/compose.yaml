@@ -2,8 +2,9 @@ services:
   rln:
     build:
       context: ${RLN_SRC:-../../rgb-lightning-node/dev}
-    command: ["/data", "--daemon-listening-port", "3001", "--ldk-peer-listening-port", "9735", "--network", "${RLN_NETWORK:-testnet}", "--disable-authentication"]
+    command: ["/data", "--config", "/etc/rln/config.toml"]
     volumes:
+      - ./rln.toml:/etc/rln/config.toml:ro
       - rln-data:/data
     ports:
       - "9735:9735"

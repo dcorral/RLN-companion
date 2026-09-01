@@ -58,6 +58,7 @@ pub enum NodeState {
     Locked,
     Unlocked,
     Down,
+    Misconfigured,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +88,22 @@ pub struct NewTransfer {
     pub batch_transfer_idx: Option<i32>,
     pub invoice: Option<String>,
     pub expiration_timestamp: Option<u64>,
+}
+
+#[cfg(test)]
+impl NewTransfer {
+    pub fn with_status(status: TransferStatus) -> Self {
+        Self {
+            asset_id: None,
+            kind: None,
+            status,
+            recipient_id: None,
+            txid: None,
+            batch_transfer_idx: None,
+            invoice: None,
+            expiration_timestamp: None,
+        }
+    }
 }
 
 pub struct Observed {
@@ -579,16 +596,7 @@ mod tests {
     use super::*;
 
     fn new_transfer(status: TransferStatus) -> NewTransfer {
-        NewTransfer {
-            asset_id: None,
-            kind: None,
-            status,
-            recipient_id: None,
-            txid: None,
-            batch_transfer_idx: None,
-            invoice: None,
-            expiration_timestamp: None,
-        }
+        NewTransfer::with_status(status)
     }
 
     fn observed(rln_idx: i32) -> Observed {

@@ -100,6 +100,7 @@ fn node_name(s: NodeState) -> &'static str {
         NodeState::Locked => "locked",
         NodeState::Unlocked => "unlocked",
         NodeState::Down => "down",
+        NodeState::Misconfigured => "misconfigured",
     }
 }
 
@@ -181,21 +182,14 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::app::{test_state, AppState};
-    use crate::config;
+    use crate::app::{test_state_at, AppState};
     use crate::intercept::interceptor_routes;
-    use crate::proxy::{self, Proxy};
-    use crate::rln::test_support::MockRln;
+    use crate::proxy;
     use crate::store::{NewTransfer, NodeState, TransferStatus};
     use TransferStatus::*;
 
     async fn state(base_url: &str) -> AppState {
-        let cfg = config::Rln {
-            base_url: base_url.to_string(),
-            proxy_timeout_secs: 5,
-            ..Default::default()
-        };
-        test_state(Proxy::new(&cfg).unwrap(), Arc::new(MockRln::default())).await
+        test_state_at(base_url).await.1
     }
 
     fn app(state: Arc<AppState>) -> Router {
@@ -242,13 +236,7 @@ mod tests {
             .insert_transfer(
                 &NewTransfer {
                     asset_id: Some(asset.into()),
-                    kind: None,
-                    status,
-                    recipient_id: None,
-                    txid: None,
-                    batch_transfer_idx: None,
-                    invoice: None,
-                    expiration_timestamp: None,
+                    ..NewTransfer::with_status(status)
                 },
                 at,
             )
@@ -322,6 +310,7 @@ mod tests {
             (NodeState::Locked, "locked"),
             (NodeState::Unknown, "unknown"),
             (NodeState::Down, "down"),
+            (NodeState::Misconfigured, "misconfigured"),
         ] {
             state.store.set_node_state(node, 1).await.unwrap();
             let (status, body) =

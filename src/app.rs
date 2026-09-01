@@ -61,6 +61,7 @@ pub async fn build_app(cfg: &Config, openapi: Option<Bytes>) -> Result<App, AppE
         store.clone(),
         cfg.engine.clone(),
         cfg.sync.clone(),
+        cfg.rln.network.clone(),
     ));
     let proxy = Proxy::new(&cfg.rln)?;
     let dispatcher = Arc::new(Dispatcher::new(store.clone(), cfg.webhook.clone())?);
@@ -112,6 +113,23 @@ pub fn spawn_background(app: &App) -> Vec<JoinHandle<()>> {
 }
 
 #[cfg(test)]
+pub fn test_rln_cfg(base_url: &str) -> crate::config::Rln {
+    crate::config::Rln {
+        base_url: base_url.to_string(),
+        proxy_timeout_secs: 5,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+pub async fn test_state_at(base_url: &str) -> (Arc<crate::rln::test_support::MockRln>, AppState) {
+    #![allow(clippy::unwrap_used)]
+    let rln = Arc::new(crate::rln::test_support::MockRln::default());
+    let state = test_state(Proxy::new(&test_rln_cfg(base_url)).unwrap(), rln.clone()).await;
+    (rln, state)
+}
+
+#[cfg(test)]
 pub async fn test_state(proxy: Proxy, rln: Arc<crate::rln::test_support::MockRln>) -> AppState {
     #![allow(clippy::unwrap_used)]
     use crate::config;
@@ -123,6 +141,7 @@ pub async fn test_state(proxy: Proxy, rln: Arc<crate::rln::test_support::MockRln
         store.clone(),
         config::Engine::default(),
         config::Sync::default(),
+        None,
     ));
     AppState {
         proxy,
@@ -146,8 +165,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::config;
-    use crate::rln::test_support::MockRln;
     use crate::store::NodeState;
 
     async fn call(router: Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -179,13 +196,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let cfg = config::Rln {
-            base_url: server.uri(),
-            proxy_timeout_secs: 5,
-            ..Default::default()
-        };
-        let state =
-            Arc::new(test_state(Proxy::new(&cfg).unwrap(), Arc::new(MockRln::default())).await);
+        let state = Arc::new(test_state_at(&server.uri()).await.1);
         let router = build_router(state.clone());
 
         let req = Request::builder()

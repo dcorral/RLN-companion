@@ -15,7 +15,9 @@ cp companion.toml.example companion.toml
 docker compose up --build --wait
 ```
 
-Both images are built from source; the RLN build takes a while the first time. `RLN_SRC` points at the RLN checkout used as build context (default `../../rgb-lightning-node/dev`); that checkout must have its `rust-lightning` submodule populated (`git clone --recurse-submodules` or `git submodule update --init`), otherwise the image build fails on the path patches. `healthy` means the companion is serving, not that the node is unlocked: read `node` in the health body. `RLN_NETWORK` selects the bitcoin network (default `testnet`), `COMPANION_BIND` and `COMPANION_PORT` change the host address and port the companion is published on (default `127.0.0.1:3101`).
+Both images are built from source; the RLN build takes a while the first time. `RLN_SRC` points at the RLN checkout used as build context (default `../../rgb-lightning-node/dev`); that checkout must have its `rust-lightning` submodule populated (`git clone --recurse-submodules` or `git submodule update --init`), otherwise the image build fails on the path patches. `healthy` means the companion is serving, not that the node is unlocked: read `node` in the health body. `COMPANION_BIND` and `COMPANION_PORT` change the host address and port the companion is published on (default `127.0.0.1:3101`).
+
+The node reads `rln.toml`, mounted read-only into the container and passed with `--config`. It is RLN's own config format, so any key from RLN's `sample-config.toml` can be added there (network, ports, auth, default indexer and proxy, channel limits). The file is committed as a template and meant to be edited in place: it ships with `network = "Testnet"`, which must match `[rln] network` in `companion.toml`. On a mismatch the companion refuses to start if the node is already unlocked; otherwise the first reconcile after `/unlock` marks the node `misconfigured` in `/companion/health` (`status` turns `degraded`) and all background work pauses until the mismatch is fixed.
 
 Then talk to the companion for everything: RLN routes are proxied 1:1 and companion-native routes live under `/companion/*`.
 
@@ -43,13 +45,13 @@ Not published: the node's API port `3001`. It is reachable only as `http://rln:3
 
 ## Biscuit authentication
 
-The default runs the node with `--disable-authentication` and publishes the companion on `127.0.0.1` only, so anyone who can reach the host's loopback can drive the node. `[service] auth_token` protects `/companion/*` only, not the proxied RLN routes. To expose the companion beyond loopback (`COMPANION_BIND=0.0.0.0`), switch the node to Biscuit auth:
+The default `rln.toml` sets `disable_authentication = true` and publishes the companion on `127.0.0.1` only, so anyone who can reach the host's loopback can drive the node. `[service] auth_token` protects `/companion/*` only, not the proxied RLN routes. To expose the companion beyond loopback (`COMPANION_BIND=0.0.0.0`), switch the node to Biscuit auth:
 
-1. Replace `--disable-authentication` with `--root-public-key <hex>` in the `rln` command.
-2. Set `[rln] token` in `companion.toml` to a Biscuit the engine can use for its own calls (`/nodeinfo`, `/listtransfers`, `/listassets`, `/refreshtransfers`, `/failtransfers`).
+1. In `rln.toml` set `disable_authentication = false` and `root_public_key = "<hex>"` under `[auth]`.
+2. Set `[rln] token` in `companion.toml` to a Biscuit the engine can use for its own calls (`/nodeinfo`, `/networkinfo`, `/listtransfers`, `/listassets`, `/refreshtransfers`, `/failtransfers`).
 3. Operators keep sending their own Biscuit in the `Authorization` header; proxied calls forward it to the node unchanged and the companion never adds one on their behalf.
 
-If `rln.token` is missing or lacks the rights the engine needs, the companion exits at startup (its probe of the node fails) and `restart: unless-stopped` restarts it in a loop; check `docker compose logs companion`.
+If `rln.token` is missing or lacks the rights the engine needs, the companion exits at startup (its probe of the node fails with `node misconfigured: ...`) and `restart: unless-stopped` restarts it in a loop; check `docker compose logs companion`.
 
 ## Webhooks
 

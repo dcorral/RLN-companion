@@ -12,7 +12,7 @@ curl -s 127.0.0.1:3101/companion/health
 | Field | Meaning |
 | --- | --- |
 | `status` | `ok` only when `node` is `unlocked` and `parked_events` is 0, otherwise `degraded` |
-| `node` | `unknown`, `locked`, `unlocked` or `down`, as last observed |
+| `node` | `unknown`, `locked`, `unlocked`, `down` or `misconfigured` (node reachable and unlocked but failing the `rln.network` check; background work is paused), as last observed |
 | `pending_transfers` | Mirrored rows in a `Waiting*` status |
 | `parked_events` | Webhook events that exhausted `webhook.max_attempts` and are no longer retried |
 | `last_full_sync_at` | Unix time of the last completed full sync, or `null` |

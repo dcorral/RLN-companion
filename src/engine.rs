@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard, Notify};
 use tokio::time::{sleep, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config;
 use crate::now;
@@ -28,6 +28,20 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Rln(#[from] RlnError),
+    #[error("node misconfigured: {0}")]
+    Misconfigured(String),
+}
+
+fn auth_fault(e: RlnError) -> EngineError {
+    match e {
+        RlnError::Api { code: 401, .. } => {
+            EngineError::Misconfigured("node requires a Biscuit token: set rln.token".into())
+        }
+        RlnError::Api { code: 403, ref name, .. } if name == "Forbidden" => {
+            EngineError::Misconfigured("rln.token lacks the rights the companion needs (admin, or custom with /refreshtransfers, /failtransfers, /listtransfers, /listassets, /nodeinfo, /networkinfo)".into())
+        }
+        e => e.into(),
+    }
 }
 
 enum Fault {
@@ -52,6 +66,7 @@ pub struct Engine<R: RlnApi + ?Sized> {
     store: Store,
     cfg: config::Engine,
     sync_cfg: config::Sync,
+    expected_network: Option<String>,
     lock: Mutex<()>,
     wake: Notify,
     #[cfg(test)]
@@ -59,12 +74,19 @@ pub struct Engine<R: RlnApi + ?Sized> {
 }
 
 impl<R: RlnApi + ?Sized> Engine<R> {
-    pub fn new(rln: Arc<R>, store: Store, cfg: config::Engine, sync_cfg: config::Sync) -> Self {
+    pub fn new(
+        rln: Arc<R>,
+        store: Store,
+        cfg: config::Engine,
+        sync_cfg: config::Sync,
+        expected_network: Option<String>,
+    ) -> Self {
         Self {
             rln,
             store,
             cfg,
             sync_cfg,
+            expected_network,
             lock: Mutex::new(()),
             wake: Notify::new(),
             #[cfg(test)]
@@ -113,17 +135,41 @@ impl<R: RlnApi + ?Sized> Engine<R> {
     }
 
     pub async fn probe(&self) -> Result<NodeState, EngineError> {
-        let state = match self.rln.node_info().await {
-            Ok(_) => NodeState::Unlocked,
-            Err(RlnError::Locked) => NodeState::Locked,
-            Err(RlnError::Transport(e)) => {
-                warn!(error = %e, "rln unreachable");
-                NodeState::Down
-            }
-            Err(e) => return Err(e.into()),
+        let checked = match self.rln.node_info().await {
+            Ok(_) => self.check_network().await,
+            Err(e) => Err(auth_fault(e)),
+        };
+        let state = match checked {
+            Ok(()) => NodeState::Unlocked,
+            Err(e) => match fault(&e) {
+                Some(Fault::Locked) => NodeState::Locked,
+                Some(Fault::Unreachable) => {
+                    warn!(error = %e, "rln unreachable");
+                    NodeState::Down
+                }
+                None => {
+                    if matches!(e, EngineError::Misconfigured(_)) {
+                        self.set_node_state(NodeState::Misconfigured).await?;
+                    }
+                    return Err(e);
+                }
+            },
         };
         self.set_node_state(state).await?;
         Ok(state)
+    }
+
+    async fn check_network(&self) -> Result<(), EngineError> {
+        let Some(want) = &self.expected_network else {
+            return Ok(());
+        };
+        let got = self.rln.network().await.map_err(auth_fault)?;
+        if got.eq_ignore_ascii_case(want) {
+            return Ok(());
+        }
+        Err(EngineError::Misconfigured(format!(
+            "node network is {got}, rln.network expects {want}"
+        )))
     }
 
     async fn classify(&self, e: EngineError) -> Result<Fault, EngineError> {
@@ -230,11 +276,20 @@ impl<R: RlnApi + ?Sized> Engine<R> {
     pub async fn reconcile(&self) -> Result<bool, EngineError> {
         let started = Instant::now();
         loop {
-            match self.full_sync().await {
+            let synced = match self.full_sync().await {
+                Ok(report) => self.check_network().await.map(|()| report),
+                Err(e) => Err(e),
+            };
+            match synced {
                 Ok(report) => {
                     info!(?report, "reconciled");
                     self.set_node_state(NodeState::Unlocked).await?;
                     return Ok(true);
+                }
+                Err(e @ EngineError::Misconfigured(_)) => {
+                    error!(error = %e, "reconcile paused");
+                    self.set_node_state(NodeState::Misconfigured).await?;
+                    return Ok(false);
                 }
                 Err(e) => match fault(&e) {
                     Some(Fault::Locked) => {
@@ -258,8 +313,10 @@ impl<R: RlnApi + ?Sized> Engine<R> {
 
     async fn backoff_probe(&self) {
         sleep(Duration::from_secs(self.cfg.reconcile_backoff_secs)).await;
-        if let Err(e) = self.probe().await {
-            warn!(error = %e, "probe failed");
+        match self.probe().await {
+            Ok(_) => {}
+            Err(e @ EngineError::Misconfigured(_)) => error!(error = %e, "probe failed"),
+            Err(e) => warn!(error = %e, "probe failed"),
         }
     }
 
@@ -322,11 +379,14 @@ mod tests {
 
     use super::*;
     use crate::config;
-    use crate::rln::test_support::{MockFailure, MockRln};
+    use crate::rln::test_support::{wait_until, MockFailure, MockRln};
     use crate::store::{NewTransfer, NodeState, Store, TransferStatus};
     use TransferStatus::*;
 
-    async fn harness(cfg: config::Engine) -> (Arc<MockRln>, Arc<Engine<MockRln>>) {
+    async fn build(
+        cfg: config::Engine,
+        network: Option<&str>,
+    ) -> (Arc<MockRln>, Arc<Engine<MockRln>>) {
         let rln = Arc::new(MockRln::default());
         let store = Store::open_in_memory().await.unwrap();
         let engine = Arc::new(Engine::new(
@@ -334,8 +394,13 @@ mod tests {
             store,
             cfg,
             config::Sync::default(),
+            network.map(str::to_string),
         ));
         (rln, engine)
+    }
+
+    async fn harness(cfg: config::Engine) -> (Arc<MockRln>, Arc<Engine<MockRln>>) {
+        build(cfg, None).await
     }
 
     async fn unlocked() -> (Arc<MockRln>, Arc<Engine<MockRln>>) {
@@ -353,13 +418,10 @@ mod tests {
     ) -> NewTransfer {
         NewTransfer {
             asset_id: asset.map(str::to_string),
-            kind: None,
-            status,
             recipient_id: recipient.map(str::to_string),
-            txid: None,
             batch_transfer_idx: idx,
-            invoice: None,
             expiration_timestamp: expiration,
+            ..NewTransfer::with_status(status)
         }
     }
 
@@ -550,16 +612,6 @@ mod tests {
         assert_eq!(state(&engine).await, NodeState::Locked);
     }
 
-    async fn wait_until(mut done: impl FnMut() -> bool) {
-        for _ in 0..200 {
-            if done() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("condition not met within 1s");
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn reconcile_retries_until_unlocked() {
         let cfg = config::Engine {
@@ -625,6 +677,97 @@ mod tests {
         set_failure(&rln, Some(MockFailure::Transport));
         assert_eq!(engine.probe().await.unwrap(), NodeState::Down);
         assert_eq!(state(&engine).await, NodeState::Down);
+    }
+
+    async fn harness_with_network(expected: Option<&str>) -> (Arc<MockRln>, Arc<Engine<MockRln>>) {
+        build(config::Engine::default(), expected).await
+    }
+
+    fn misconfigured(err: EngineError) -> String {
+        match err {
+            EngineError::Misconfigured(msg) => msg,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_missing_token() {
+        let (rln, engine) = harness(config::Engine::default()).await;
+        set_failure(&rln, Some(MockFailure::Unauthorized));
+
+        let msg = misconfigured(engine.probe().await.unwrap_err());
+        assert!(msg.contains("rln.token"), "{msg}");
+        assert_eq!(state(&engine).await, NodeState::Misconfigured);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_forbidden_token() {
+        let (rln, engine) = harness(config::Engine::default()).await;
+        set_failure(&rln, Some(MockFailure::Forbidden));
+
+        let msg = misconfigured(engine.probe().await.unwrap_err());
+        assert!(msg.contains("rln.token"), "{msg}");
+        assert!(msg.contains("/networkinfo"), "{msg}");
+        assert_eq!(state(&engine).await, NodeState::Misconfigured);
+    }
+
+    #[tokio::test]
+    async fn probe_checks_expected_network() {
+        let (_, engine) = harness_with_network(Some("testnet")).await;
+        let msg = misconfigured(engine.probe().await.unwrap_err());
+        assert!(msg.contains("Regtest") && msg.contains("testnet"), "{msg}");
+        assert_eq!(state(&engine).await, NodeState::Misconfigured);
+
+        let (rln, engine) = harness_with_network(Some("regtest")).await;
+        assert_eq!(engine.probe().await.unwrap(), NodeState::Unlocked);
+        assert_eq!(rln.calls(), vec!["node_info", "network"]);
+    }
+
+    #[tokio::test]
+    async fn probe_folds_network_call_faults() {
+        for (failure, expected) in [
+            (MockFailure::Locked, NodeState::Locked),
+            (MockFailure::Transport, NodeState::Down),
+        ] {
+            let (rln, engine) = harness_with_network(Some("regtest")).await;
+            *rln.fail_call.lock().unwrap() = Some(("network".into(), failure));
+
+            assert_eq!(engine.probe().await.unwrap(), expected);
+            assert_eq!(state(&engine).await, expected);
+            assert_eq!(rln.calls(), vec!["node_info", "network"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_recovers_from_misconfigured() {
+        let (rln, engine) = harness_with_network(Some("regtest")).await;
+        engine
+            .set_node_state(NodeState::Misconfigured)
+            .await
+            .unwrap();
+
+        assert_eq!(engine.probe().await.unwrap(), NodeState::Unlocked);
+        assert_eq!(state(&engine).await, NodeState::Unlocked);
+        assert_eq!(rln.calls(), vec!["node_info", "network"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_wrong_network_pauses_as_misconfigured() {
+        let (rln, engine) = harness_with_network(Some("testnet")).await;
+        rln.add_asset("A", "NIA", vec![]);
+
+        assert!(!engine.reconcile().await.unwrap());
+
+        assert_eq!(state(&engine).await, NodeState::Misconfigured);
+        let calls = rln.calls();
+        assert!(calls.contains(&"network".to_string()), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn probe_skips_network_check_when_unset() {
+        let (rln, engine) = harness_with_network(None).await;
+        assert_eq!(engine.probe().await.unwrap(), NodeState::Unlocked);
+        assert_eq!(rln.calls(), vec!["node_info"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
