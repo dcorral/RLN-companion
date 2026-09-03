@@ -1,0 +1,21 @@
+[service]
+listen_port = 3121
+
+[rln]
+base_url = "http://127.0.0.1:3022"
+network = "Regtest"
+
+[engine]
+refresh_interval_secs = 2
+payments_poll_interval_secs = 1
+
+[sync]
+full_interval_secs = 5
+
+[webhook]
+url = "http://127.0.0.1:9921/hook"
+secret = "demo-secret"
+dispatch_interval_secs = 1
+
+[database]
+path = "tmp/companion.sqlite"
