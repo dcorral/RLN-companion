@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use crate::config;
 use crate::rln::{RlnApi, RlnError, RlnTransfer};
-use crate::store::{Observed, Store, StoreError, Transfer, TransferStatus};
+use crate::store::{
+    NewPayment, Observed, Payment, PaymentStatus, Store, StoreError, Transfer, TransferStatus,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
@@ -57,6 +59,74 @@ pub fn plan_transition(stored: &Transfer, observed: TransferStatus) -> Option<Tr
     };
     Some(Transition {
         transfer_id: stored.id.clone(),
+        from,
+        to: observed,
+        event,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentEventType {
+    Settled,
+    Failed,
+}
+
+impl PaymentEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Settled => "payment.settled",
+            Self::Failed => "payment.failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentTransition {
+    pub payment_hash: String,
+    pub from: PaymentStatus,
+    pub to: PaymentStatus,
+    pub event: Option<PaymentEventType>,
+}
+
+fn payment_rank(s: PaymentStatus) -> u8 {
+    match s {
+        PaymentStatus::Pending => 0,
+        PaymentStatus::Claimable => 1,
+        PaymentStatus::Claiming => 2,
+        PaymentStatus::Succeeded | PaymentStatus::Failed | PaymentStatus::Cancelled => 3,
+    }
+}
+
+pub fn plan_payment_transition(
+    stored: &Payment,
+    observed: PaymentStatus,
+) -> Option<PaymentTransition> {
+    let from = stored.status;
+    if from.terminal() {
+        // RLN reuses the hash of a failed/cancelled payment on retry: restart silently.
+        // A Succeeded hash is never reset, so it stays final.
+        if observed != PaymentStatus::Pending
+            || !matches!(from, PaymentStatus::Failed | PaymentStatus::Cancelled)
+        {
+            return None;
+        }
+        return Some(PaymentTransition {
+            payment_hash: stored.payment_hash.clone(),
+            from,
+            to: observed,
+            event: None,
+        });
+    }
+    if payment_rank(observed) <= payment_rank(from) {
+        return None;
+    }
+    let event = match observed {
+        PaymentStatus::Succeeded => Some(PaymentEventType::Settled),
+        PaymentStatus::Failed | PaymentStatus::Cancelled => Some(PaymentEventType::Failed),
+        _ => None,
+    };
+    Some(PaymentTransition {
+        payment_hash: stored.payment_hash.clone(),
         from,
         to: observed,
         event,
@@ -197,6 +267,106 @@ pub async fn apply_observed(
     Ok(applied)
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentSyncReport {
+    pub payments: usize,
+    pub transitions: usize,
+}
+
+pub async fn sync_payments<R: RlnApi + ?Sized>(
+    rln: &R,
+    store: &Store,
+    cfg: &config::Sync,
+    now: i64,
+) -> Result<PaymentSyncReport, SyncError> {
+    let payments = rln
+        .list_payments(cfg.page_size)
+        .await
+        .inspect_err(|e| warn!(error = %e, "list_payments failed"))?;
+    let baseline = store.payments_baseline_at().await?;
+    let mut report = PaymentSyncReport::default();
+    for p in payments {
+        // Before the baseline everything backfills silently; after it, a payment first
+        // seen already terminal inserts as Pending so the terminal transition emits.
+        let insert_status = if baseline.is_some() && p.status.terminal() {
+            PaymentStatus::Pending
+        } else {
+            p.status
+        };
+        let observed = NewPayment {
+            payment_hash: p.payment_hash,
+            direction: p.payment_type.direction(),
+            status: insert_status,
+            asset_id: p.asset_id,
+            asset_amount: p.asset_amount,
+            amt_msat: p.amt_msat,
+            payee_pubkey: Some(p.payee_pubkey),
+        };
+        let row = store.upsert_payment_observed(&observed, now).await?;
+        report.payments += 1;
+        if apply_payment_observed(store, &row, p.status, now).await? {
+            report.transitions += 1;
+        }
+    }
+    if baseline.is_none() {
+        store.set_payments_baseline_at(now).await?;
+    }
+    debug!(?report, "payments sync done");
+    Ok(report)
+}
+
+pub async fn apply_payment_observed(
+    store: &Store,
+    row: &Payment,
+    observed: PaymentStatus,
+    now: i64,
+) -> Result<bool, SyncError> {
+    let Some(tr) = plan_payment_transition(row, observed) else {
+        return Ok(false);
+    };
+    let event_id = Uuid::new_v4().to_string();
+    let payload = tr
+        .event
+        .map(|e| payment_event_payload(&event_id, e, row.clone(), &tr, now))
+        .transpose()?;
+    let event = tr
+        .event
+        .zip(payload.as_deref())
+        .map(|(e, p)| (event_id.as_str(), e.as_str(), p));
+    let applied = store
+        .apply_payment_transition(&tr.payment_hash, tr.from, tr.to, event, now)
+        .await?;
+    if applied {
+        info!(
+            payment_hash = %tr.payment_hash,
+            from = ?tr.from,
+            to = ?tr.to,
+            event = ?tr.event,
+            "payment transition"
+        );
+    }
+    Ok(applied)
+}
+
+fn payment_event_payload(
+    event_id: &str,
+    event: PaymentEventType,
+    mut row: Payment,
+    tr: &PaymentTransition,
+    now: i64,
+) -> Result<String, serde_json::Error> {
+    row.status = tr.to;
+    row.updated_at = now;
+    serde_json::to_string(&json!({
+        "event_id": event_id,
+        "event_type": event.as_str(),
+        "payment": row,
+        "previous_status": tr.from,
+        "new_status": tr.to,
+        "timestamp": now,
+    }))
+}
+
 async fn fetch_assets<R: RlnApi + ?Sized>(
     rln: &R,
     store: &Store,
@@ -317,6 +487,331 @@ mod tests {
             Failed,
         ] {
             assert_eq!(plan(Settled, observed), None, "{observed:?}");
+        }
+    }
+
+    mod payments {
+        use super::*;
+        use crate::rln::test_support::{MockFailure, MockRln};
+        use crate::rln::RlnPaymentType;
+        use crate::store::{NewPayment, PaymentDirection, PaymentStatus};
+
+        fn cfg() -> config::Sync {
+            config::Sync {
+                full_interval_secs: 600,
+                page_size: 100,
+            }
+        }
+
+        async fn store() -> Store {
+            Store::open_in_memory().await.unwrap()
+        }
+
+        fn stored_payment(status: PaymentStatus) -> Payment {
+            Payment {
+                payment_hash: "h1".into(),
+                direction: PaymentDirection::Inbound,
+                status,
+                asset_id: None,
+                asset_amount: None,
+                amt_msat: None,
+                payee_pubkey: None,
+                created_at: 1,
+                updated_at: 1,
+                last_seen_at: None,
+            }
+        }
+
+        fn plan(from: PaymentStatus, to: PaymentStatus) -> Option<PaymentTransition> {
+            plan_payment_transition(&stored_payment(from), to)
+        }
+
+        #[test]
+        fn payment_plan_moves_forward_with_event_on_terminal() {
+            use PaymentStatus::*;
+            for (from, to, event) in [
+                (Pending, Claimable, None),
+                (Pending, Claiming, None),
+                (Claimable, Claiming, None),
+                (Pending, Succeeded, Some(PaymentEventType::Settled)),
+                (Claiming, Succeeded, Some(PaymentEventType::Settled)),
+                (Pending, Failed, Some(PaymentEventType::Failed)),
+                (Claimable, Cancelled, Some(PaymentEventType::Failed)),
+                (Failed, Pending, None),
+                (Cancelled, Pending, None),
+            ] {
+                assert_eq!(
+                    plan(from, to),
+                    Some(PaymentTransition {
+                        payment_hash: "h1".into(),
+                        from,
+                        to,
+                        event
+                    }),
+                    "{from:?} -> {to:?}"
+                );
+            }
+            for (from, to) in [
+                (Pending, Pending),
+                (Claiming, Claimable),
+                (Claiming, Pending),
+                (Succeeded, Failed),
+                (Succeeded, Pending),
+                (Failed, Succeeded),
+                (Failed, Failed),
+                (Failed, Claiming),
+                (Cancelled, Claimable),
+            ] {
+                assert_eq!(plan(from, to), None, "{from:?} -> {to:?}");
+            }
+        }
+
+        async fn seed_pending(store: &Store, hash: &str) {
+            store
+                .insert_pending_payment(
+                    &NewPayment {
+                        payment_hash: hash.into(),
+                        direction: PaymentDirection::Outbound,
+                        status: PaymentStatus::Pending,
+                        asset_id: None,
+                        asset_amount: None,
+                        amt_msat: Some(1000),
+                        payee_pubkey: None,
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn settle_emits_payment_settled_with_payload() {
+            let rln = MockRln::default();
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Succeeded,
+                RlnPaymentType::Outbound,
+            )]);
+            let store = store().await;
+            seed_pending(&store, "h1").await;
+
+            let report = sync_payments(&rln, &store, &cfg(), 42).await.unwrap();
+
+            assert_eq!(
+                report,
+                PaymentSyncReport {
+                    payments: 1,
+                    transitions: 1
+                }
+            );
+            assert_eq!(rln.calls(), vec!["list_payments"]);
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Succeeded);
+            assert_eq!(row.updated_at, 42);
+            assert_eq!(row.last_seen_at, Some(42));
+            assert_eq!(row.asset_id.as_deref(), Some("rgb:asset"));
+            let events = store.undelivered_events(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "payment.settled");
+            let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+            assert_eq!(payload["event_id"], events[0].id);
+            assert_eq!(payload["event_type"], "payment.settled");
+            assert_eq!(payload["previous_status"], "Pending");
+            assert_eq!(payload["new_status"], "Succeeded");
+            assert_eq!(payload["timestamp"], 42);
+            assert_eq!(payload["payment"]["payment_hash"], "h1");
+            assert_eq!(payload["payment"]["status"], "Succeeded");
+            assert_eq!(payload["payment"]["direction"], "Outbound");
+            assert_eq!(payload["payment"]["asset_id"], "rgb:asset");
+            assert_eq!(payload["payment"]["asset_amount"], 42);
+            assert_eq!(payload["payment"]["amt_msat"], 3000000);
+            assert_eq!(payload["payment"]["payee_pubkey"], "02aa");
+            assert_eq!(payload["payment"]["updated_at"], 42);
+        }
+
+        #[tokio::test]
+        async fn second_run_is_idempotent() {
+            let rln = MockRln::default();
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Succeeded,
+                RlnPaymentType::Outbound,
+            )]);
+            let store = store().await;
+            seed_pending(&store, "h1").await;
+
+            sync_payments(&rln, &store, &cfg(), 2).await.unwrap();
+            let report = sync_payments(&rln, &store, &cfg(), 3).await.unwrap();
+
+            assert_eq!(report.transitions, 0);
+            assert_eq!(store.undelivered_events(10).await.unwrap().len(), 1);
+            assert_eq!(store.list_payments(None, 10).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn failed_and_cancelled_emit_payment_failed() {
+            for observed in [PaymentStatus::Failed, PaymentStatus::Cancelled] {
+                let rln = MockRln::default();
+                rln.set_payments(vec![MockRln::payment(
+                    "h1",
+                    observed,
+                    RlnPaymentType::InboundAutoClaim,
+                )]);
+                let store = store().await;
+                seed_pending(&store, "h1").await;
+
+                let report = sync_payments(&rln, &store, &cfg(), 5).await.unwrap();
+
+                assert_eq!(report.transitions, 1, "{observed:?}");
+                let row = store.get_payment("h1").await.unwrap().unwrap();
+                assert_eq!(row.status, observed);
+                let events = store.undelivered_events(10).await.unwrap();
+                assert_eq!(events.len(), 1, "{observed:?}");
+                assert_eq!(events[0].event_type, "payment.failed");
+                let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+                assert_eq!(payload["event_type"], "payment.failed");
+                assert_eq!(payload["payment"]["direction"], "Inbound");
+            }
+        }
+
+        #[tokio::test]
+        async fn pending_and_claim_stages_stay_silent() {
+            let rln = MockRln::default();
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Pending,
+                RlnPaymentType::InboundHodl,
+            )]);
+            let store = store().await;
+
+            let report = sync_payments(&rln, &store, &cfg(), 2).await.unwrap();
+
+            assert_eq!(
+                report,
+                PaymentSyncReport {
+                    payments: 1,
+                    transitions: 0
+                }
+            );
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Pending);
+            assert_eq!(row.direction, PaymentDirection::Inbound);
+            assert!(store.undelivered_events(10).await.unwrap().is_empty());
+
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Claimable,
+                RlnPaymentType::InboundHodl,
+            )]);
+            let report = sync_payments(&rln, &store, &cfg(), 3).await.unwrap();
+
+            assert_eq!(report.transitions, 1);
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Claimable);
+            assert!(store.undelivered_events(10).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn first_sync_backfills_terminal_silently_and_sets_baseline() {
+            let rln = MockRln::default();
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Succeeded,
+                RlnPaymentType::Outbound,
+            )]);
+            let store = store().await;
+            assert_eq!(store.payments_baseline_at().await.unwrap(), None);
+
+            let report = sync_payments(&rln, &store, &cfg(), 2).await.unwrap();
+
+            assert_eq!(report.transitions, 0);
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Succeeded);
+            assert!(store.undelivered_events(10).await.unwrap().is_empty());
+            assert_eq!(store.payments_baseline_at().await.unwrap(), Some(2));
+        }
+
+        #[tokio::test]
+        async fn terminal_discovered_after_baseline_emits() {
+            let rln = MockRln::default();
+            let store = store().await;
+            sync_payments(&rln, &store, &cfg(), 1).await.unwrap();
+            assert_eq!(store.payments_baseline_at().await.unwrap(), Some(1));
+
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Succeeded,
+                RlnPaymentType::InboundAutoClaim,
+            )]);
+            let report = sync_payments(&rln, &store, &cfg(), 5).await.unwrap();
+
+            assert_eq!(report.transitions, 1);
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Succeeded);
+            assert_eq!(row.created_at, 5);
+            let events = store.undelivered_events(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "payment.settled");
+            let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+            assert_eq!(payload["previous_status"], "Pending");
+            assert_eq!(payload["new_status"], "Succeeded");
+            assert_eq!(payload["payment"]["direction"], "Inbound");
+            assert_eq!(store.payments_baseline_at().await.unwrap(), Some(1));
+        }
+
+        #[tokio::test]
+        async fn failed_retry_restarts_silently_then_settles() {
+            let rln = MockRln::default();
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Failed,
+                RlnPaymentType::Outbound,
+            )]);
+            let store = store().await;
+            sync_payments(&rln, &store, &cfg(), 1).await.unwrap();
+            assert!(store.undelivered_events(10).await.unwrap().is_empty());
+
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Pending,
+                RlnPaymentType::Outbound,
+            )]);
+            let report = sync_payments(&rln, &store, &cfg(), 2).await.unwrap();
+
+            assert_eq!(report.transitions, 1);
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Pending);
+            assert!(store.undelivered_events(10).await.unwrap().is_empty());
+
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Succeeded,
+                RlnPaymentType::Outbound,
+            )]);
+            let report = sync_payments(&rln, &store, &cfg(), 3).await.unwrap();
+
+            assert_eq!(report.transitions, 1);
+            let row = store.get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Succeeded);
+            let events = store.undelivered_events(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "payment.settled");
+            let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+            assert_eq!(payload["previous_status"], "Pending");
+            assert_eq!(payload["new_status"], "Succeeded");
+        }
+
+        #[tokio::test]
+        async fn locked_propagates() {
+            let rln = MockRln::default();
+            *rln.fail_with.lock().unwrap() = Some(MockFailure::Locked);
+            let store = store().await;
+
+            let err = sync_payments(&rln, &store, &cfg(), 2).await.unwrap_err();
+
+            assert!(matches!(err, SyncError::Rln(RlnError::Locked)), "{err:?}");
+            assert!(store.list_payments(None, 10).await.unwrap().is_empty());
+            assert_eq!(store.payments_baseline_at().await.unwrap(), None);
         }
     }
 

@@ -16,6 +16,7 @@ Config is a TOML file loaded with `--config <path>`. Every key has a default (`s
 | `engine.refresh_interval_secs` | `10` | How often `/refreshtransfers` is driven while transfers are pending |
 | `engine.skip_sync` | `false` | `skip_sync` value sent on the companion's `/refreshtransfers` calls; keep `false` when witness receives are used |
 | `engine.reap_interval_secs` | `300` | How often expired transfers are failed through `/failtransfers` |
+| `engine.payments_poll_interval_secs` | `3` | How often `/listpayments` is polled to mirror LN payment state; inbound payments arrive over P2P at any moment, so the poll runs constantly while the node is unlocked (it is a cheap read on RLN) |
 | `engine.reconcile_backoff_secs` | `5` | Wait between reconcile attempts and re-probes while the node is locked or unreachable |
 | `engine.reconcile_max_wait_secs` | `600` | Maximum time the startup reconcile waits for the node before giving up |
 | `sync.full_interval_secs` | `600` | How often a full transfer sync from RLN runs |

@@ -27,6 +27,8 @@ refresh_interval_secs = 10
 skip_sync = false
 # how often expired tracked transfers are failed via /failtransfers
 reap_interval_secs = 300
+# how often /listpayments is polled to mirror LN payment state while the node is unlocked
+payments_poll_interval_secs = 3
 # wait between reconcile attempts while the node is locked or unreachable
 reconcile_backoff_secs = 5
 # maximum wait before a reconcile attempt is given up

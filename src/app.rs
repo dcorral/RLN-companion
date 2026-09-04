@@ -108,6 +108,7 @@ pub fn spawn_background(app: &App) -> Vec<JoinHandle<()>> {
         tokio::spawn(app.engine.clone().run_refresh_loop()),
         tokio::spawn(app.engine.clone().run_reaper()),
         tokio::spawn(app.engine.clone().run_full_sync_timer()),
+        tokio::spawn(app.engine.clone().run_payments_loop()),
         tokio::spawn(app.dispatcher.clone().run()),
     ]
 }
@@ -252,7 +253,7 @@ mod tests {
         );
         assert!(dir.path().join("companion.sqlite").exists());
         let handles = spawn_background(&app);
-        assert_eq!(handles.len(), 4);
+        assert_eq!(handles.len(), 5);
         tokio::task::yield_now().await;
         for h in &handles {
             assert!(!h.is_finished());

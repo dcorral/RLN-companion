@@ -14,7 +14,7 @@ use tracing::error;
 
 use crate::app::AppState;
 use crate::proxy::{self, error_body};
-use crate::store::{NodeState, StoreError, Transfer, TransferStatus};
+use crate::store::{NodeState, Payment, PaymentStatus, StoreError, Transfer, TransferStatus};
 
 const DEFAULT_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 1000;
@@ -54,6 +54,7 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
         .route("/companion/transfers", get(list_transfers))
         .route("/companion/transfers/:id", get(get_transfer))
+        .route("/companion/payments", get(list_payments))
         .route("/companion/openapi.yaml", get(proxy::openapi))
         .route_layer(middleware::from_fn_with_state(state, require_token));
     Router::new()
@@ -90,6 +91,7 @@ struct Health {
     status: &'static str,
     node: &'static str,
     pending_transfers: usize,
+    pending_payments: usize,
     parked_events: u64,
     last_full_sync_at: Option<i64>,
 }
@@ -107,6 +109,7 @@ fn node_name(s: NodeState) -> &'static str {
 async fn health(State(state): State<Arc<AppState>>) -> Result<Json<Health>, ApiError> {
     let node = state.store.node_state().await?;
     let pending_transfers = state.store.pending_transfers().await?.len();
+    let pending_payments = state.store.pending_payments().await?.len();
     let parked_events = state
         .store
         .parked_events_count(state.webhook_max_attempts)
@@ -121,6 +124,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Result<Json<Health>, ApiE
         status,
         node: node_name(node),
         pending_transfers,
+        pending_payments,
         parked_events,
         last_full_sync_at,
     }))
@@ -158,6 +162,34 @@ async fn list_transfers(
     Ok(Json(TransferList { transfers }))
 }
 
+#[derive(Deserialize)]
+struct PaymentListQuery {
+    status: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct PaymentList {
+    payments: Vec<Payment>,
+}
+
+async fn list_payments(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<PaymentListQuery>, QueryRejection>,
+) -> Result<Json<PaymentList>, ApiError> {
+    let Query(q) = query.map_err(|e| ApiError::InvalidRequest(e.body_text()))?;
+    let status = q
+        .status
+        .map(|s| {
+            serde_json::from_value::<PaymentStatus>(serde_json::Value::String(s.clone()))
+                .map_err(|_| ApiError::InvalidRequest(format!("invalid status: {s}")))
+        })
+        .transpose()?;
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let payments = state.store.list_payments(status, limit).await?;
+    Ok(Json(PaymentList { payments }))
+}
+
 async fn get_transfer(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -185,7 +217,7 @@ mod tests {
     use crate::app::{test_state_at, AppState};
     use crate::intercept::interceptor_routes;
     use crate::proxy;
-    use crate::store::{NewTransfer, NodeState, TransferStatus};
+    use crate::store::{NewPayment, NewTransfer, NodeState, PaymentDirection, TransferStatus};
     use TransferStatus::*;
 
     async fn state(base_url: &str) -> AppState {
@@ -245,6 +277,25 @@ mod tests {
             .id
     }
 
+    async fn insert_payment(state: &AppState, hash: &str, status: PaymentStatus, at: i64) {
+        state
+            .store
+            .insert_pending_payment(
+                &NewPayment {
+                    payment_hash: hash.into(),
+                    direction: PaymentDirection::Outbound,
+                    status,
+                    asset_id: None,
+                    asset_amount: None,
+                    amt_msat: Some(1000),
+                    payee_pubkey: None,
+                },
+                at,
+            )
+            .await
+            .unwrap();
+    }
+
     async fn park_event(state: &AppState) -> String {
         let id = insert(state, Initiated, "A", 1).await;
         state
@@ -282,6 +333,8 @@ mod tests {
         insert(&state, WaitingCounterparty, "A", 1).await;
         insert(&state, WaitingConfirmations, "A", 2).await;
         insert(&state, Settled, "A", 3).await;
+        insert_payment(&state, "h1", PaymentStatus::Pending, 1).await;
+        insert_payment(&state, "h2", PaymentStatus::Succeeded, 2).await;
         let ev = park_event(&state).await;
 
         let (status, body) = call_json(app(state.clone()), get("/companion/health", None)).await;
@@ -292,6 +345,7 @@ mod tests {
                 "status": "degraded",
                 "node": "unlocked",
                 "pending_transfers": 2,
+                "pending_payments": 1,
                 "parked_events": 1,
                 "last_full_sync_at": null
             })
@@ -410,6 +464,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_payments_newest_first_with_filter_and_limit() {
+        let server = MockServer::start().await;
+        let state = Arc::new(state(&server.uri()).await);
+        insert_payment(&state, "h1", PaymentStatus::Pending, 1).await;
+        insert_payment(&state, "h2", PaymentStatus::Succeeded, 2).await;
+        insert_payment(&state, "h3", PaymentStatus::Pending, 3).await;
+
+        let hashes = |body: &Value| -> Vec<String> {
+            body["payments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["payment_hash"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (status, body) = call_json(app(state.clone()), get("/companion/payments", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hashes(&body), vec!["h3", "h2", "h1"]);
+        assert_eq!(body["payments"][0]["status"], "Pending");
+        assert_eq!(body["payments"][0]["direction"], "Outbound");
+        assert_eq!(body["payments"][0]["amt_msat"], 1000);
+        assert_eq!(body["payments"][0]["created_at"], 3);
+
+        let (status, body) = call_json(
+            app(state.clone()),
+            get("/companion/payments?status=Succeeded", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hashes(&body), vec!["h2"]);
+
+        let (status, body) =
+            call_json(app(state.clone()), get("/companion/payments?limit=1", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hashes(&body), vec!["h3"]);
+
+        let (status, body) = call_json(
+            app(state.clone()),
+            get("/companion/payments?status=Bogus", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error(&body, 400, "InvalidRequest");
+
+        let (status, body) = call_json(
+            app(state.clone()),
+            get("/companion/payments?limit=abc", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error(&body, 400, "InvalidRequest");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn get_transfer_by_id_and_404() {
         let server = MockServer::start().await;
         let state = Arc::new(state(&server.uri()).await);
@@ -442,7 +551,11 @@ mod tests {
         state.openapi = Some(Bytes::from_static(b"openapi: 3.0.0\n"));
         let state = Arc::new(state);
 
-        for uri in ["/companion/transfers", "/companion/openapi.yaml"] {
+        for uri in [
+            "/companion/transfers",
+            "/companion/payments",
+            "/companion/openapi.yaml",
+        ] {
             let (status, body) = call_json(app(state.clone()), get(uri, None)).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
             assert_error(&body, 401, "Unauthorized");
@@ -475,6 +588,7 @@ mod tests {
         let open = Arc::new(open);
         for uri in [
             "/companion/transfers",
+            "/companion/payments",
             "/companion/openapi.yaml",
             "/companion/health",
         ] {

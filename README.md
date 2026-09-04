@@ -23,6 +23,7 @@ flowchart LR
 | You must call `/refreshtransfers` in a loop, with the right body, at the right cadence, or transfers never settle (and non-donation sends are never even broadcast) | The companion drives refresh by itself, only while something is pending |
 | You must remember identifiers RLN never returns again (`batch_transfer_idx`) to cancel expired transfers | The companion keeps them and fails expired transfers for you |
 | You poll `/listtransfers` per asset to learn that a transfer settled | You get a signed webhook: `transfer.confirmed_pending`, `transfer.settled`, `transfer.failed` |
+| You poll `/listpayments` to learn that a Lightning payment settled | You get a signed webhook: `payment.settled`, `payment.failed` |
 | RLN's refresh answers `{}` whatever happened | The companion diffs transfer state and reports real transitions |
 
 Everything else is a transparent proxy: any RLN route works through the companion exactly as it does on the node, including auth (RLN keeps enforcing its own tokens).
@@ -88,13 +89,13 @@ mark_paid(order_for(payload["transfer"]["recipient_id"]))
 return 200
 ```
 
-Three event types: `transfer.confirmed_pending` (broadcast, waiting for confirmations), `transfer.settled`, `transfer.failed`. Delivery is at-least-once, in order, with retries and backoff; events that keep failing are parked and show up in health. Full details in [docs/webhooks.md](docs/webhooks.md).
+Five event types: `transfer.confirmed_pending` (broadcast, waiting for confirmations), `transfer.settled`, `transfer.failed`, plus `payment.settled` and `payment.failed` for Lightning payments. Delivery is at-least-once, in order, with retries and backoff; events that keep failing are parked and show up in health. Full details in [docs/webhooks.md](docs/webhooks.md).
 
 ## Health at a glance
 
 ```sh
 curl -s 127.0.0.1:3101/companion/health
-{"status":"ok","node":"unlocked","pending_transfers":1,"parked_events":0,"last_full_sync_at":1756640000}
+{"status":"ok","node":"unlocked","pending_transfers":1,"pending_payments":0,"parked_events":0,"last_full_sync_at":1756640000}
 ```
 
 `status` is `ok` only when the node is unlocked and no webhook is stuck; anything else is `degraded` and the other fields say why.

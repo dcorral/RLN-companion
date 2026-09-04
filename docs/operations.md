@@ -14,6 +14,10 @@ A locked node cannot report its network, so the network mismatch is only fatal w
 
 If the reconcile gives up, the mirror stays stale until the periodic full sync (`sync.full_interval_secs`) runs against an unlocked node, or `/unlock` goes through the companion, which triggers a reconcile immediately. The refresh loop itself only re-probes node state and syncs pending rows.
 
+## The payments poll
+
+Lightning payments never touch `/refreshtransfers`: they settle through the channel state machine, and inbound ones arrive over P2P at any moment, so unlike transfers there is nothing to intercept that would announce them. The companion therefore polls `/listpayments` every `engine.payments_poll_interval_secs` while the node is unlocked, diffs statuses forward-only and fires `payment.settled` / `payment.failed` webhooks on terminal transitions. The poll is a cheap read on RLN, so it runs constantly rather than pending-aware (the expensive refresh loop stays pending-aware), and it does not take the single-flight lock.
+
 ## Node state
 
 The companion tracks whether the node is `unknown`, `locked`, `unlocked`, `down` or `misconfigured` from the lifecycle routes it proxies, from 403 answers that reveal the state and from the `rln.network` check. While the node is not `unlocked`, all background work pauses and the node is re-probed on every refresh interval, so an outage of any length is recovered automatically once the node is back.

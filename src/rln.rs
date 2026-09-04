@@ -2,7 +2,7 @@ use reqwest::RequestBuilder;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::config;
-use crate::store::TransferStatus;
+use crate::store::{PaymentDirection, PaymentStatus, TransferStatus};
 
 #[derive(Serialize)]
 pub struct RefreshRequest {
@@ -41,6 +41,50 @@ pub struct RlnTransfer {
     pub recipient_id: Option<String>,
     pub txid: Option<String>,
     pub expiration_timestamp: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct ListPaymentsResponse {
+    pub payments: Vec<RlnPayment>,
+    pub first_index_offset: u64,
+    pub last_index_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub enum RlnPaymentType {
+    Outbound,
+    InboundAutoClaim,
+    InboundHodl,
+}
+
+impl RlnPaymentType {
+    pub fn direction(self) -> PaymentDirection {
+        match self {
+            Self::Outbound => PaymentDirection::Outbound,
+            Self::InboundAutoClaim | Self::InboundHodl => PaymentDirection::Inbound,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RlnPayment {
+    pub amt_msat: Option<u64>,
+    pub asset_amount: Option<u64>,
+    pub asset_id: Option<String>,
+    pub payment_hash: String,
+    pub payment_type: RlnPaymentType,
+    pub status: PaymentStatus,
+    pub payee_pubkey: String,
+}
+
+#[derive(Serialize)]
+pub struct DecodeLNInvoiceRequest {
+    pub invoice: String,
+}
+
+#[derive(Deserialize)]
+pub struct DecodeLNInvoiceResponse {
+    pub payment_hash: String,
 }
 
 #[derive(Serialize)]
@@ -112,6 +156,8 @@ pub trait RlnApi: Send + Sync {
         page_size: u64,
     ) -> Result<Vec<RlnTransfer>, RlnError>;
     async fn list_assetless_transfers(&self, page_size: u64) -> Result<Vec<RlnTransfer>, RlnError>;
+    async fn list_payments(&self, page_size: u64) -> Result<Vec<RlnPayment>, RlnError>;
+    async fn decode_ln_invoice(&self, invoice: &str) -> Result<String, RlnError>;
     /// (asset_id, schema) with schema one of NIA, UDA, CFA, IFA.
     async fn list_assets(&self) -> Result<Vec<(String, String)>, RlnError>;
     async fn fail_transfer(&self, batch_transfer_idx: i32) -> Result<(), RlnError>;
@@ -239,6 +285,36 @@ impl RlnApi for HttpRlnClient {
         self.list(AssetFilter::None, page_size).await
     }
 
+    async fn list_payments(&self, page_size: u64) -> Result<Vec<RlnPayment>, RlnError> {
+        let page_size = page_size.max(1);
+        let mut out = Vec::new();
+        let mut index_offset: Option<u64> = None;
+        loop {
+            let mut req = self
+                .client
+                .get(self.url("/listpayments"))
+                .query(&[("max_payments", page_size)]);
+            if let Some(offset) = index_offset {
+                req = req.query(&[("index_offset", offset)]);
+            }
+            let page: ListPaymentsResponse = self.send(req).await?;
+            let count = page.payments.len() as u64;
+            out.extend(page.payments);
+            if count < page_size || index_offset == Some(page.last_index_offset) {
+                return Ok(out);
+            }
+            index_offset = Some(page.last_index_offset);
+        }
+    }
+
+    async fn decode_ln_invoice(&self, invoice: &str) -> Result<String, RlnError> {
+        let body = DecodeLNInvoiceRequest {
+            invoice: invoice.to_string(),
+        };
+        let resp: DecodeLNInvoiceResponse = self.post("/decodelninvoice", &body).await?;
+        Ok(resp.payment_hash)
+    }
+
     async fn list_assets(&self) -> Result<Vec<(String, String)>, RlnError> {
         let body = ListAssetsRequest {
             filter_asset_schemas: vec![],
@@ -336,6 +412,8 @@ pub mod test_support {
     pub struct MockRln {
         pub transfers: Mutex<HashMap<String, Vec<RlnTransfer>>>,
         pub assets: Mutex<Vec<(String, String)>>,
+        pub payments: Mutex<Vec<RlnPayment>>,
+        pub invoices: Mutex<HashMap<String, String>>,
         pub fail_with: Mutex<Option<MockFailure>>,
         pub fail_call: Mutex<Option<(String, MockFailure)>>,
         pub calls: Mutex<Vec<String>>,
@@ -348,6 +426,8 @@ pub mod test_support {
             Self {
                 transfers: Mutex::default(),
                 assets: Mutex::default(),
+                payments: Mutex::default(),
+                invoices: Mutex::default(),
                 fail_with: Mutex::default(),
                 fail_call: Mutex::default(),
                 calls: Mutex::default(),
@@ -358,6 +438,32 @@ pub mod test_support {
     }
 
     impl MockRln {
+        pub fn payment(
+            hash: &str,
+            status: crate::store::PaymentStatus,
+            payment_type: RlnPaymentType,
+        ) -> RlnPayment {
+            RlnPayment {
+                amt_msat: Some(3000000),
+                asset_amount: Some(42),
+                asset_id: Some("rgb:asset".into()),
+                payment_hash: hash.into(),
+                payment_type,
+                status,
+                payee_pubkey: "02aa".into(),
+            }
+        }
+
+        pub fn set_payments(&self, payments: Vec<RlnPayment>) {
+            *self.payments.lock().unwrap() = payments;
+        }
+
+        pub fn add_invoice(&self, invoice: &str, payment_hash: &str) {
+            self.invoices
+                .lock()
+                .unwrap()
+                .insert(invoice.into(), payment_hash.into());
+        }
         pub fn transfer(idx: i32, status: TransferStatus, recipient: Option<&str>) -> RlnTransfer {
             RlnTransfer {
                 idx,
@@ -440,6 +546,22 @@ pub mod test_support {
                 .unwrap_or_default())
         }
 
+        async fn list_payments(&self, page_size: u64) -> Result<Vec<RlnPayment>, RlnError> {
+            self.record("list_payments".into())?;
+            self.page_sizes.lock().unwrap().push(page_size);
+            Ok(self.payments.lock().unwrap().clone())
+        }
+
+        async fn decode_ln_invoice(&self, invoice: &str) -> Result<String, RlnError> {
+            self.record(format!("decode_ln_invoice:{invoice}"))?;
+            self.invoices
+                .lock()
+                .unwrap()
+                .get(invoice)
+                .cloned()
+                .ok_or_else(|| RlnError::Decode(format!("unknown invoice {invoice}")))
+        }
+
         async fn list_assets(&self) -> Result<Vec<(String, String)>, RlnError> {
             self.record("list_assets".into())?;
             Ok(self.assets.lock().unwrap().clone())
@@ -467,8 +589,11 @@ mod tests {
 
     use super::*;
     use crate::config;
+    use crate::store::{PaymentDirection, PaymentStatus};
     use serde_json::json;
-    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
     struct NoAuthHeader;
@@ -572,6 +697,98 @@ mod tests {
         assert_eq!(transfers[0].recipient_id.as_deref(), Some("rcpt9"));
         assert_eq!(transfers[0].expiration_timestamp, Some(123));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    fn payment(hash: &str) -> serde_json::Value {
+        json!({
+            "amt_msat": 3000000,
+            "asset_amount": 42,
+            "asset_id": "rgb:asset",
+            "payment_hash": hash,
+            "payment_type": "Outbound",
+            "status": "Pending",
+            "created_at": 1,
+            "updated_at": 2,
+            "payee_pubkey": "02aa",
+            "preimage": null,
+            "description": null,
+            "description_hash": null
+        })
+    }
+
+    #[tokio::test]
+    async fn list_payments_follows_query_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/listpayments"))
+            .and(query_param("max_payments", "2"))
+            .and(query_param_is_missing("index_offset"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "payments": [payment("aa"), payment("bb")],
+                "first_index_offset": 9,
+                "last_index_offset": 5
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/listpayments"))
+            .and(query_param("max_payments", "2"))
+            .and(query_param("index_offset", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "payments": [payment("cc")],
+                "first_index_offset": 2,
+                "last_index_offset": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payments = client(&server, None).list_payments(2).await.unwrap();
+
+        let hashes: Vec<&str> = payments.iter().map(|p| p.payment_hash.as_str()).collect();
+        assert_eq!(hashes, vec!["aa", "bb", "cc"]);
+        assert_eq!(payments[0].status, PaymentStatus::Pending);
+        assert_eq!(
+            payments[0].payment_type.direction(),
+            PaymentDirection::Outbound
+        );
+        assert_eq!(payments[0].amt_msat, Some(3000000));
+        assert_eq!(payments[0].asset_amount, Some(42));
+        assert_eq!(payments[0].asset_id.as_deref(), Some("rgb:asset"));
+        assert_eq!(payments[0].payee_pubkey, "02aa");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn decode_ln_invoice_returns_payment_hash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/decodelninvoice"))
+            .and(body_json(json!({ "invoice": "lnbcrt1..." })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "amt_msat": 3000000,
+                "expiry_sec": 420,
+                "timestamp": 1,
+                "asset_id": null,
+                "asset_amount": null,
+                "description": null,
+                "description_hash": null,
+                "payment_hash": "cafe",
+                "payment_secret": "s",
+                "payee_pubkey": "02aa",
+                "min_final_cltv_expiry_delta": 40,
+                "network": "Regtest"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let hash = client(&server, None)
+            .decode_ln_invoice("lnbcrt1...")
+            .await
+            .unwrap();
+        assert_eq!(hash, "cafe");
     }
 
     #[tokio::test]

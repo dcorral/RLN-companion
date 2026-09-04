@@ -53,6 +53,28 @@ impl TransferStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Claimable,
+    Claiming,
+    Cancelled,
+}
+
+impl PaymentStatus {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
     Unknown,
     Locked,
@@ -114,6 +136,30 @@ pub struct Observed {
     pub recipient_id: Option<String>,
     pub txid: Option<String>,
     pub expiration_timestamp: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Payment {
+    pub payment_hash: String,
+    pub direction: PaymentDirection,
+    pub status: PaymentStatus,
+    pub asset_id: Option<String>,
+    pub asset_amount: Option<u64>,
+    pub amt_msat: Option<u64>,
+    pub payee_pubkey: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: Option<i64>,
+}
+
+pub struct NewPayment {
+    pub payment_hash: String,
+    pub direction: PaymentDirection,
+    pub status: PaymentStatus,
+    pub asset_id: Option<String>,
+    pub asset_amount: Option<u64>,
+    pub amt_msat: Option<u64>,
+    pub payee_pubkey: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -185,6 +231,56 @@ impl TryFrom<TransferRow> for Transfer {
     }
 }
 
+const ALL_PAYMENT_STATUSES: [PaymentStatus; 6] = [
+    PaymentStatus::Pending,
+    PaymentStatus::Succeeded,
+    PaymentStatus::Failed,
+    PaymentStatus::Claimable,
+    PaymentStatus::Claiming,
+    PaymentStatus::Cancelled,
+];
+
+const SELECT_PAYMENT: &str = "SELECT payment_hash, direction, status, asset_id, asset_amount, \
+    amt_msat, payee_pubkey, created_at, updated_at, last_seen_at FROM payments";
+
+#[derive(sqlx::FromRow)]
+struct PaymentRow {
+    payment_hash: String,
+    direction: String,
+    status: String,
+    asset_id: Option<String>,
+    asset_amount: Option<i64>,
+    amt_msat: Option<i64>,
+    payee_pubkey: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    last_seen_at: Option<i64>,
+}
+
+impl TryFrom<PaymentRow> for Payment {
+    type Error = StoreError;
+
+    fn try_from(r: PaymentRow) -> Result<Self, StoreError> {
+        let amount = |v: Option<i64>| {
+            v.map(u64::try_from)
+                .transpose()
+                .map_err(|_| StoreError::Corrupt(format!("negative amount on {}", r.payment_hash)))
+        };
+        Ok(Payment {
+            direction: enum_from_str(&r.direction)?,
+            status: enum_from_str(&r.status)?,
+            asset_id: r.asset_id,
+            asset_amount: amount(r.asset_amount)?,
+            amt_msat: amount(r.amt_msat)?,
+            payee_pubkey: r.payee_pubkey,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            last_seen_at: r.last_seen_at,
+            payment_hash: r.payment_hash,
+        })
+    }
+}
+
 fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StoreError> {
     match serde_json::to_value(v) {
         Ok(Value::String(s)) => Ok(s),
@@ -203,8 +299,24 @@ fn ts_to_db(v: Option<u64>) -> Result<Option<i64>, StoreError> {
         .map_err(|_| StoreError::Corrupt("expiration_timestamp out of range".into()))
 }
 
+fn amt_to_db(v: Option<u64>) -> Result<Option<i64>, StoreError> {
+    v.map(i64::try_from)
+        .transpose()
+        .map_err(|_| StoreError::Corrupt("amount out of range".into()))
+}
+
 fn status_in(pred: fn(TransferStatus) -> bool) -> Result<(String, Vec<String>), StoreError> {
     let names = ALL_STATUSES
+        .iter()
+        .filter(|s| pred(**s))
+        .map(enum_to_str)
+        .collect::<Result<Vec<_>, _>>()?;
+    let placeholders = vec!["?"; names.len()].join(", ");
+    Ok((format!("status IN ({placeholders})"), names))
+}
+
+fn payment_status_in(pred: fn(PaymentStatus) -> bool) -> Result<(String, Vec<String>), StoreError> {
+    let names = ALL_PAYMENT_STATUSES
         .iter()
         .filter(|s| pred(**s))
         .map(enum_to_str)
@@ -440,6 +552,134 @@ impl Store {
         Ok(true)
     }
 
+    async fn upsert_payment(
+        &self,
+        p: &NewPayment,
+        last_seen_at: Option<i64>,
+        now: i64,
+    ) -> Result<Payment, StoreError> {
+        sqlx::query_as::<_, PaymentRow>(
+            "INSERT INTO payments (payment_hash, direction, status, asset_id, asset_amount, \
+             amt_msat, payee_pubkey, created_at, updated_at, last_seen_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (payment_hash) DO UPDATE SET direction = excluded.direction, \
+             asset_id = COALESCE(excluded.asset_id, asset_id), \
+             asset_amount = COALESCE(excluded.asset_amount, asset_amount), \
+             amt_msat = COALESCE(excluded.amt_msat, amt_msat), \
+             payee_pubkey = COALESCE(excluded.payee_pubkey, payee_pubkey), \
+             last_seen_at = COALESCE(excluded.last_seen_at, last_seen_at) \
+             RETURNING payment_hash, direction, status, asset_id, asset_amount, amt_msat, \
+             payee_pubkey, created_at, updated_at, last_seen_at",
+        )
+        .bind(&p.payment_hash)
+        .bind(enum_to_str(&p.direction)?)
+        .bind(enum_to_str(&p.status)?)
+        .bind(&p.asset_id)
+        .bind(amt_to_db(p.asset_amount)?)
+        .bind(amt_to_db(p.amt_msat)?)
+        .bind(&p.payee_pubkey)
+        .bind(now)
+        .bind(now)
+        .bind(last_seen_at)
+        .fetch_one(&self.pool)
+        .await?
+        .try_into()
+    }
+
+    pub async fn upsert_payment_observed(
+        &self,
+        p: &NewPayment,
+        now: i64,
+    ) -> Result<Payment, StoreError> {
+        self.upsert_payment(p, Some(now), now).await
+    }
+
+    pub async fn insert_pending_payment(
+        &self,
+        p: &NewPayment,
+        now: i64,
+    ) -> Result<Payment, StoreError> {
+        self.upsert_payment(p, None, now).await
+    }
+
+    pub async fn apply_payment_transition(
+        &self,
+        payment_hash: &str,
+        from: PaymentStatus,
+        to: PaymentStatus,
+        event: Option<(&str, &str, &str)>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        if from == to {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let affected = sqlx::query(
+            "UPDATE payments SET status = ?, updated_at = ? WHERE payment_hash = ? AND status = ?",
+        )
+        .bind(enum_to_str(&to)?)
+        .bind(now)
+        .bind(payment_hash)
+        .bind(enum_to_str(&from)?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Ok(false);
+        }
+        if let Some((event_id, event_type, payload)) = event {
+            sqlx::query(
+                "INSERT INTO webhook_outbox (id, event_type, payload, next_attempt_at) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(event_id)
+            .bind(event_type)
+            .bind(payload)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn pending_payments(&self) -> Result<Vec<Payment>, StoreError> {
+        let (clause, names) = payment_status_in(|s| !s.terminal())?;
+        let sql = format!("{SELECT_PAYMENT} WHERE {clause} ORDER BY created_at, rowid");
+        let mut q = sqlx::query_as::<_, PaymentRow>(&sql);
+        for n in names {
+            q = q.bind(n);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter().map(Payment::try_from).collect()
+    }
+
+    pub async fn list_payments(
+        &self,
+        status: Option<PaymentStatus>,
+        limit: u32,
+    ) -> Result<Vec<Payment>, StoreError> {
+        let status = status.map(|s| enum_to_str(&s)).transpose()?;
+        let rows = sqlx::query_as::<_, PaymentRow>(&format!(
+            "{SELECT_PAYMENT} WHERE (?1 IS NULL OR status = ?1) \
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2"
+        ))
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Payment::try_from).collect()
+    }
+
+    pub async fn get_payment(&self, payment_hash: &str) -> Result<Option<Payment>, StoreError> {
+        sqlx::query_as::<_, PaymentRow>(&format!("{SELECT_PAYMENT} WHERE payment_hash = ?"))
+            .bind(payment_hash)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(Payment::try_from)
+            .transpose()
+    }
+
     pub async fn upsert_assets(
         &self,
         assets: &[(String, String)],
@@ -511,6 +751,22 @@ impl Store {
 
     pub async fn set_last_full_sync_at(&self, now: i64) -> Result<(), StoreError> {
         sqlx::query("UPDATE node_state SET last_full_sync_at = ? WHERE id = 1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn payments_baseline_at(&self) -> Result<Option<i64>, StoreError> {
+        Ok(sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT payments_baseline_at FROM node_state WHERE id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn set_payments_baseline_at(&self, now: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE node_state SET payments_baseline_at = ? WHERE id = 1")
             .bind(now)
             .execute(&self.pool)
             .await?;
@@ -1195,6 +1451,245 @@ mod tests {
 
         store.mark_delivered(&id, 30).await.unwrap();
         assert!(store.undelivered_events(100).await.unwrap().is_empty());
+    }
+
+    fn new_payment(hash: &str, status: PaymentStatus) -> NewPayment {
+        NewPayment {
+            payment_hash: hash.into(),
+            direction: PaymentDirection::Outbound,
+            status,
+            asset_id: Some("assetA".into()),
+            asset_amount: Some(10),
+            amt_msat: Some(3000),
+            payee_pubkey: Some("02aa".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_insert_and_get_roundtrip() {
+        let store = Store::open_in_memory().await.unwrap();
+        let p = store
+            .insert_pending_payment(&new_payment("h1", PaymentStatus::Pending), 100)
+            .await
+            .unwrap();
+        assert_eq!(p.payment_hash, "h1");
+        assert_eq!(p.direction, PaymentDirection::Outbound);
+        assert_eq!(p.status, PaymentStatus::Pending);
+        assert_eq!(p.asset_id.as_deref(), Some("assetA"));
+        assert_eq!(p.asset_amount, Some(10));
+        assert_eq!(p.amt_msat, Some(3000));
+        assert_eq!(p.payee_pubkey.as_deref(), Some("02aa"));
+        assert_eq!(p.created_at, 100);
+        assert_eq!(p.updated_at, 100);
+        assert_eq!(p.last_seen_at, None);
+        let got = store.get_payment("h1").await.unwrap().unwrap();
+        assert_eq!(got.status, PaymentStatus::Pending);
+        assert_eq!(got.amt_msat, Some(3000));
+        assert!(store.get_payment("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn insert_pending_payment_conflict_keeps_status() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_pending_payment(&new_payment("h1", PaymentStatus::Pending), 1)
+            .await
+            .unwrap();
+        let mut again = new_payment("h1", PaymentStatus::Succeeded);
+        again.amt_msat = Some(4000);
+        again.asset_id = None;
+        let p = store.insert_pending_payment(&again, 2).await.unwrap();
+        assert_eq!(p.status, PaymentStatus::Pending);
+        assert_eq!(p.amt_msat, Some(4000));
+        assert_eq!(p.asset_id.as_deref(), Some("assetA"));
+        assert_eq!(p.created_at, 1);
+        assert_eq!(store.list_payments(None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_payment_observed_inserts_and_merges_without_status() {
+        let store = Store::open_in_memory().await.unwrap();
+        let p = store
+            .upsert_payment_observed(&new_payment("h1", PaymentStatus::Pending), 5)
+            .await
+            .unwrap();
+        assert_eq!(p.last_seen_at, Some(5));
+        assert_eq!(p.created_at, 5);
+        let mut o = new_payment("h1", PaymentStatus::Succeeded);
+        o.amt_msat = None;
+        o.asset_id = None;
+        let p = store.upsert_payment_observed(&o, 9).await.unwrap();
+        assert_eq!(p.status, PaymentStatus::Pending);
+        assert_eq!(p.last_seen_at, Some(9));
+        assert_eq!(p.amt_msat, Some(3000));
+        assert_eq!(p.asset_id.as_deref(), Some("assetA"));
+        assert_eq!(p.created_at, 5);
+        assert_eq!(store.list_payments(None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_payment_observed_merges_into_interceptor_row() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_pending_payment(&new_payment("h1", PaymentStatus::Pending), 1)
+            .await
+            .unwrap();
+        let p = store
+            .upsert_payment_observed(&new_payment("h1", PaymentStatus::Succeeded), 2)
+            .await
+            .unwrap();
+        assert_eq!(p.status, PaymentStatus::Pending);
+        assert_eq!(p.last_seen_at, Some(2));
+        assert_eq!(p.created_at, 1);
+        assert_eq!(store.list_payments(None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn payment_transition_writes_outbox_event() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_pending_payment(&new_payment("h1", PaymentStatus::Pending), 1)
+            .await
+            .unwrap();
+        let changed = store
+            .apply_payment_transition(
+                "h1",
+                PaymentStatus::Pending,
+                PaymentStatus::Succeeded,
+                Some(("pev-1", "payment.settled", "{\"x\":1}")),
+                42,
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+        let p = store.get_payment("h1").await.unwrap().unwrap();
+        assert_eq!(p.status, PaymentStatus::Succeeded);
+        assert_eq!(p.updated_at, 42);
+        let events = store.undelivered_events(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "pev-1");
+        assert_eq!(events[0].event_type, "payment.settled");
+        assert_eq!(events[0].payload, "{\"x\":1}");
+        assert_eq!(events[0].next_attempt_at, 42);
+    }
+
+    #[tokio::test]
+    async fn payment_transition_idempotent_and_stale_from_noop() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_pending_payment(&new_payment("h1", PaymentStatus::Pending), 1)
+            .await
+            .unwrap();
+        let ev = Some(("pev-1", "payment.settled", "{}"));
+        assert!(store
+            .apply_payment_transition(
+                "h1",
+                PaymentStatus::Pending,
+                PaymentStatus::Succeeded,
+                ev,
+                5
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .apply_payment_transition(
+                "h1",
+                PaymentStatus::Pending,
+                PaymentStatus::Succeeded,
+                ev,
+                6
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .apply_payment_transition(
+                "h1",
+                PaymentStatus::Claimable,
+                PaymentStatus::Failed,
+                Some(("pev-2", "payment.failed", "{}")),
+                7
+            )
+            .await
+            .unwrap());
+        assert_eq!(store.undelivered_events(10).await.unwrap().len(), 1);
+        let p = store.get_payment("h1").await.unwrap().unwrap();
+        assert_eq!(p.status, PaymentStatus::Succeeded);
+        assert_eq!(p.updated_at, 5);
+    }
+
+    #[tokio::test]
+    async fn pending_payments_returns_only_non_terminal() {
+        let store = Store::open_in_memory().await.unwrap();
+        for (hash, status) in [
+            ("h1", PaymentStatus::Pending),
+            ("h2", PaymentStatus::Claimable),
+            ("h3", PaymentStatus::Claiming),
+            ("h4", PaymentStatus::Succeeded),
+            ("h5", PaymentStatus::Failed),
+            ("h6", PaymentStatus::Cancelled),
+        ] {
+            store
+                .insert_pending_payment(&new_payment(hash, status), 1)
+                .await
+                .unwrap();
+        }
+        let hashes: Vec<String> = store
+            .pending_payments()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.payment_hash)
+            .collect();
+        assert_eq!(hashes, vec!["h1", "h2", "h3"]);
+    }
+
+    #[tokio::test]
+    async fn payments_baseline_roundtrip_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.sqlite");
+        let path = path.to_str().unwrap();
+        let store = Store::open(path).await.unwrap();
+        assert_eq!(store.payments_baseline_at().await.unwrap(), None);
+        store.set_payments_baseline_at(7).await.unwrap();
+        assert_eq!(store.payments_baseline_at().await.unwrap(), Some(7));
+        store.close().await;
+        let reopened = Store::open(path).await.unwrap();
+        assert_eq!(reopened.payments_baseline_at().await.unwrap(), Some(7));
+        reopened.set_payments_baseline_at(9).await.unwrap();
+        assert_eq!(reopened.payments_baseline_at().await.unwrap(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn list_payments_newest_first_filter_and_limit() {
+        let store = Store::open_in_memory().await.unwrap();
+        for (hash, status, at) in [
+            ("h1", PaymentStatus::Pending, 1),
+            ("h2", PaymentStatus::Succeeded, 2),
+            ("h3", PaymentStatus::Pending, 3),
+        ] {
+            store
+                .insert_pending_payment(&new_payment(hash, status), at)
+                .await
+                .unwrap();
+        }
+        let hashes = |v: Vec<Payment>| v.into_iter().map(|p| p.payment_hash).collect::<Vec<_>>();
+        assert_eq!(
+            hashes(store.list_payments(None, 10).await.unwrap()),
+            vec!["h3", "h2", "h1"]
+        );
+        assert_eq!(
+            hashes(
+                store
+                    .list_payments(Some(PaymentStatus::Pending), 10)
+                    .await
+                    .unwrap()
+            ),
+            vec!["h3", "h1"]
+        );
+        assert_eq!(
+            hashes(store.list_payments(None, 2).await.unwrap()),
+            vec!["h3", "h2"]
+        );
     }
 
     #[tokio::test]

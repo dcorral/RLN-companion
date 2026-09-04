@@ -24,6 +24,9 @@ The request is forwarded exactly like the proxy does. Only when RLN answers 2xx 
 | `POST /issueassetnia`, `/issueassetcfa`, `/issueassetuda`, `/issueassetifa` | Asset recorded with its schema; background sync of that asset |
 | `POST /inflate` | Background sync of the asset |
 | `POST /assetlink` | Background sync of the parent and child assets |
+| `POST /keysend` | Outbound payment row inserted from the request and response; a response that is already terminal also emits the payment event |
+| `POST /sendpayment` | Outbound payment row inserted from the request and response; a response that is already terminal also emits the payment event like `/keysend` (skipped when the response carries no `payment_hash`) |
+| `POST /lninvoice` | The returned invoice is decoded through `/decodelninvoice` and an inbound `Pending` payment row is inserted |
 | `POST /refreshtransfers`, `POST /failtransfers` | Serialized with the refresh loop (the engine lock is held across the RLN call), then the pending transfers are re-synced from RLN |
 | `POST /init`, `/restore`, `/lock` | Node state set to `locked` (RLN requires a locked node for init and restore and leaves it locked) |
 | `POST /unlock` | Node state set to `unlocked`, then a full reconcile runs in the background |

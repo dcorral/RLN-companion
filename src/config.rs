@@ -83,6 +83,7 @@ pub struct Engine {
     pub refresh_interval_secs: u64,
     pub skip_sync: bool,
     pub reap_interval_secs: u64,
+    pub payments_poll_interval_secs: u64,
     pub reconcile_backoff_secs: u64,
     pub reconcile_max_wait_secs: u64,
 }
@@ -93,6 +94,7 @@ impl Default for Engine {
             refresh_interval_secs: 10,
             skip_sync: false,
             reap_interval_secs: 300,
+            payments_poll_interval_secs: 3,
             reconcile_backoff_secs: 5,
             reconcile_max_wait_secs: 600,
         }
@@ -179,6 +181,10 @@ impl Config {
                 self.engine.refresh_interval_secs,
             ),
             ("engine.reap_interval_secs", self.engine.reap_interval_secs),
+            (
+                "engine.payments_poll_interval_secs",
+                self.engine.payments_poll_interval_secs,
+            ),
             (
                 "engine.reconcile_backoff_secs",
                 self.engine.reconcile_backoff_secs,
@@ -345,6 +351,9 @@ mod tests {
         let mut cfg = base.clone();
         cfg.engine.reap_interval_secs = 0;
         expect_zero(&cfg, "engine.reap_interval_secs");
+        let mut cfg = base.clone();
+        cfg.engine.payments_poll_interval_secs = 0;
+        expect_zero(&cfg, "engine.payments_poll_interval_secs");
         let mut cfg = base.clone();
         cfg.engine.reconcile_backoff_secs = 0;
         expect_zero(&cfg, "engine.reconcile_backoff_secs");

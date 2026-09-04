@@ -9,13 +9,21 @@ use crate::config;
 use crate::now;
 use crate::rln::{RlnApi, RlnError};
 use crate::store::{NodeState, Store, StoreError, TransferStatus};
-use crate::sync::{apply_observed, sync, Scope, SyncError, SyncReport};
+use crate::sync::{apply_observed, sync, sync_payments, Scope, SyncError, SyncReport};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TickOutcome {
     Idle,
     Paused,
     Refreshed(SyncReport),
+    Locked,
+    Unreachable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaymentsTickOutcome {
+    Paused,
+    Synced(crate::sync::PaymentSyncReport),
     Locked,
     Unreachable,
 }
@@ -232,6 +240,23 @@ impl<R: RlnApi + ?Sized> Engine<R> {
         }
     }
 
+    pub async fn decode_ln_invoice(&self, invoice: &str) -> Result<String, EngineError> {
+        Ok(self.rln.decode_ln_invoice(invoice).await?)
+    }
+
+    pub async fn payments_tick(&self, now: i64) -> Result<PaymentsTickOutcome, EngineError> {
+        if self.store.node_state().await? != NodeState::Unlocked {
+            return Ok(PaymentsTickOutcome::Paused);
+        }
+        match sync_payments(&*self.rln, &self.store, &self.sync_cfg, now).await {
+            Ok(report) => Ok(PaymentsTickOutcome::Synced(report)),
+            Err(e) => Ok(match self.classify(e.into()).await? {
+                Fault::Locked => PaymentsTickOutcome::Locked,
+                Fault::Unreachable => PaymentsTickOutcome::Unreachable,
+            }),
+        }
+    }
+
     pub async fn reap(&self, now: i64) -> Result<usize, EngineError> {
         let _g = self.lock().await;
         let mut failed = 0;
@@ -347,6 +372,18 @@ impl<R: RlnApi + ?Sized> Engine<R> {
             match self.reap(now()).await {
                 Ok(n) => debug!(failed = n, "reap"),
                 Err(e) => warn!(error = %e, "reap failed"),
+            }
+        }
+    }
+
+    pub async fn run_payments_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(self.cfg.payments_poll_interval_secs);
+        loop {
+            sleep(interval).await;
+            match self.payments_tick(now()).await {
+                Ok(PaymentsTickOutcome::Unreachable) => self.backoff_probe().await,
+                Ok(outcome) => debug!(?outcome, "payments tick"),
+                Err(e) => warn!(error = %e, "payments tick failed"),
             }
         }
     }
@@ -808,6 +845,86 @@ mod tests {
         task.abort();
 
         assert_eq!(state(&engine).await, NodeState::Unlocked);
+    }
+
+    mod payments {
+        use super::*;
+        use crate::rln::RlnPaymentType;
+        use crate::store::PaymentStatus;
+
+        #[tokio::test]
+        async fn tick_paused_when_node_not_unlocked() {
+            let (rln, engine) = harness(config::Engine::default()).await;
+            engine.set_node_state(NodeState::Locked).await.unwrap();
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Pending,
+                RlnPaymentType::Outbound,
+            )]);
+
+            assert_eq!(
+                engine.payments_tick(2).await.unwrap(),
+                PaymentsTickOutcome::Paused
+            );
+            assert!(rln.calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn tick_syncs_when_unlocked() {
+            let (rln, engine) = unlocked().await;
+            rln.set_payments(vec![MockRln::payment(
+                "h1",
+                PaymentStatus::Pending,
+                RlnPaymentType::Outbound,
+            )]);
+
+            let outcome = engine.payments_tick(2).await.unwrap();
+
+            let PaymentsTickOutcome::Synced(report) = outcome else {
+                panic!("unexpected {outcome:?}");
+            };
+            assert_eq!(report.payments, 1);
+            assert_eq!(rln.calls(), vec!["list_payments"]);
+            let row = engine.store().get_payment("h1").await.unwrap().unwrap();
+            assert_eq!(row.status, PaymentStatus::Pending);
+        }
+
+        #[tokio::test]
+        async fn tick_locked_sets_node_state() {
+            let (rln, engine) = unlocked().await;
+            set_failure(&rln, Some(MockFailure::Locked));
+
+            assert_eq!(
+                engine.payments_tick(2).await.unwrap(),
+                PaymentsTickOutcome::Locked
+            );
+            assert_eq!(state(&engine).await, NodeState::Locked);
+        }
+
+        #[tokio::test]
+        async fn tick_transport_error_is_unreachable() {
+            let (rln, engine) = unlocked().await;
+            set_failure(&rln, Some(MockFailure::Transport));
+
+            assert_eq!(
+                engine.payments_tick(2).await.unwrap(),
+                PaymentsTickOutcome::Unreachable
+            );
+            assert_eq!(state(&engine).await, NodeState::Unlocked);
+        }
+
+        #[tokio::test]
+        async fn tick_api_error_is_err() {
+            let (rln, engine) = unlocked().await;
+            set_failure(&rln, Some(MockFailure::Api));
+
+            let err = engine.payments_tick(2).await.unwrap_err();
+
+            assert!(
+                matches!(err, EngineError::Sync(SyncError::Rln(RlnError::Api { .. }))),
+                "{err:?}"
+            );
+        }
     }
 
     #[tokio::test]

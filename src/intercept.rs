@@ -15,12 +15,18 @@ use crate::app::AppState;
 use crate::engine::EngineError;
 use crate::now;
 use crate::proxy::note_locked;
-use crate::store::{NewTransfer, NodeState, TransferStatus};
+use crate::store::{
+    NewPayment, NewTransfer, NodeState, PaymentDirection, PaymentStatus, TransferStatus,
+};
+use crate::sync::apply_payment_observed;
 
 pub fn interceptor_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/rgbinvoice", post(rgbinvoice))
         .route("/sendrgb", post(sendrgb))
+        .route("/keysend", post(keysend))
+        .route("/sendpayment", post(sendpayment))
+        .route("/lninvoice", post(lninvoice))
         .route("/issueassetnia", post(|State(s), r| issue(s, r, "NIA")))
         .route("/issueassetcfa", post(|State(s), r| issue(s, r, "CFA")))
         .route("/issueassetuda", post(|State(s), r| issue(s, r, "UDA")))
@@ -63,6 +69,12 @@ enum HookError {
 
 impl From<crate::store::StoreError> for HookError {
     fn from(e: crate::store::StoreError) -> Self {
+        Self::Engine(e.into())
+    }
+}
+
+impl From<crate::sync::SyncError> for HookError {
+    fn from(e: crate::sync::SyncError) -> Self {
         Self::Engine(e.into())
     }
 }
@@ -173,6 +185,120 @@ async fn sendrgb(State(state): State<Arc<AppState>>, req: Request) -> Response {
         }
         spawn_asset_sync(&state, assets);
         state.engine.wake();
+        Ok(())
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct KeysendRequest {
+    dest_pubkey: String,
+    amt_msat: u64,
+    asset_id: Option<String>,
+    asset_amount: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PaymentResponse {
+    payment_hash: Option<String>,
+    status: PaymentStatus,
+}
+
+async fn record_outbound_payment(
+    state: &AppState,
+    resp: PaymentResponse,
+    asset_id: Option<String>,
+    asset_amount: Option<u64>,
+    amt_msat: Option<u64>,
+    payee_pubkey: Option<String>,
+) -> Result<(), HookError> {
+    let Some(payment_hash) = resp.payment_hash else {
+        warn!("payment response carries no payment_hash, not mirrored");
+        return Ok(());
+    };
+    let row = NewPayment {
+        payment_hash,
+        direction: PaymentDirection::Outbound,
+        status: PaymentStatus::Pending,
+        asset_id,
+        asset_amount,
+        amt_msat,
+        payee_pubkey,
+    };
+    let now = now();
+    let inserted = state.store.insert_pending_payment(&row, now).await?;
+    apply_payment_observed(&state.store, &inserted, resp.status, now).await?;
+    Ok(())
+}
+
+async fn keysend(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    forward_then(&state, req, |state, ex| async move {
+        let req: KeysendRequest = ex.parse_req()?;
+        let resp: PaymentResponse = ex.parse_resp()?;
+        record_outbound_payment(
+            &state,
+            resp,
+            req.asset_id,
+            req.asset_amount,
+            Some(req.amt_msat),
+            Some(req.dest_pubkey),
+        )
+        .await
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct SendPaymentRequest {
+    amt_msat: Option<u64>,
+    asset_id: Option<String>,
+    asset_amount: Option<u64>,
+}
+
+async fn sendpayment(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    forward_then(&state, req, |state, ex| async move {
+        let req: SendPaymentRequest = ex.parse_req()?;
+        let resp: PaymentResponse = ex.parse_resp()?;
+        record_outbound_payment(
+            &state,
+            resp,
+            req.asset_id,
+            req.asset_amount,
+            req.amt_msat,
+            None,
+        )
+        .await
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct LNInvoiceRequest {
+    amt_msat: Option<u64>,
+    asset_id: Option<String>,
+    asset_amount: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LNInvoiceResponse {
+    invoice: String,
+}
+
+async fn lninvoice(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    forward_then(&state, req, |state, ex| async move {
+        let req: LNInvoiceRequest = ex.parse_req()?;
+        let resp: LNInvoiceResponse = ex.parse_resp()?;
+        let payment_hash = state.engine.decode_ln_invoice(&resp.invoice).await?;
+        let row = NewPayment {
+            payment_hash,
+            direction: PaymentDirection::Inbound,
+            status: PaymentStatus::Pending,
+            asset_id: req.asset_id,
+            asset_amount: req.asset_amount,
+            amt_msat: req.amt_msat,
+            payee_pubkey: None,
+        };
+        state.store.insert_pending_payment(&row, now()).await?;
         Ok(())
     })
     .await
@@ -658,6 +784,189 @@ mod tests {
         assert_eq!(body, err);
         assert_eq!(node_state(&state).await, NodeState::Unknown);
         assert!(rln.calls().is_empty());
+    }
+
+    mod payments {
+        use super::*;
+        use crate::store::{Payment, PaymentDirection, PaymentStatus};
+
+        async fn payment_rows(state: &AppState) -> Vec<Payment> {
+            state.store.list_payments(None, 10).await.unwrap()
+        }
+
+        fn keysend_req() -> Request<Body> {
+            post(
+                "/keysend",
+                json!({
+                    "dest_pubkey": "02bb",
+                    "amt_msat": 3000000,
+                    "asset_id": "rgb:asset",
+                    "asset_amount": 42
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn keysend_inserts_outbound_row() {
+            let server = MockServer::start().await;
+            let upstream = br#"{"payment_hash":"aa","payment_preimage":"pp","status":"Pending"}"#;
+            mount(&server, "/keysend", 200, upstream).await;
+            let (_, state, app) = harness(&server.uri()).await;
+
+            let (status, body) = call(app, keysend_req()).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, upstream);
+            let rows = payment_rows(&state).await;
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.payment_hash, "aa");
+            assert_eq!(row.direction, PaymentDirection::Outbound);
+            assert_eq!(row.status, PaymentStatus::Pending);
+            assert_eq!(row.amt_msat, Some(3000000));
+            assert_eq!(row.asset_id.as_deref(), Some("rgb:asset"));
+            assert_eq!(row.asset_amount, Some(42));
+            assert_eq!(row.payee_pubkey.as_deref(), Some("02bb"));
+            assert!(state.store.undelivered_events(10).await.unwrap().is_empty());
+            assert_eq!(state.engine.wake_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn keysend_immediately_succeeded_emits_settled() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "/keysend",
+                200,
+                br#"{"payment_hash":"aa","payment_preimage":"pp","status":"Succeeded"}"#,
+            )
+            .await;
+            let (_, state, app) = harness(&server.uri()).await;
+
+            let (status, _) = call(app, keysend_req()).await;
+
+            assert_eq!(status, StatusCode::OK);
+            let rows = payment_rows(&state).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, PaymentStatus::Succeeded);
+            let events = state.store.undelivered_events(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "payment.settled");
+            let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+            assert_eq!(payload["previous_status"], "Pending");
+            assert_eq!(payload["new_status"], "Succeeded");
+            assert_eq!(payload["payment"]["payment_hash"], "aa");
+        }
+
+        #[tokio::test]
+        async fn keysend_upstream_error_inserts_nothing() {
+            let server = MockServer::start().await;
+            mount(&server, "/keysend", 403, LOCKED).await;
+            let (_, state, app) = harness(&server.uri()).await;
+
+            let (status, _) = call(app, keysend_req()).await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(payment_rows(&state).await.is_empty());
+            assert_eq!(node_state(&state).await, NodeState::Locked);
+        }
+
+        #[tokio::test]
+        async fn sendpayment_inserts_pending_outbound() {
+            let server = MockServer::start().await;
+            let upstream = br#"{"payment_id":"x","payment_hash":"bb","payment_secret":"s","status":"Pending"}"#;
+            mount(&server, "/sendpayment", 200, upstream).await;
+            let (_, state, app) = harness(&server.uri()).await;
+
+            let req = post(
+                "/sendpayment",
+                json!({"invoice": "lni", "amt_msat": 7000, "asset_id": null, "asset_amount": null}),
+            );
+            let (status, body) = call(app, req).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, upstream);
+            let rows = payment_rows(&state).await;
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.payment_hash, "bb");
+            assert_eq!(row.direction, PaymentDirection::Outbound);
+            assert_eq!(row.status, PaymentStatus::Pending);
+            assert_eq!(row.amt_msat, Some(7000));
+            assert_eq!(row.asset_id, None);
+            assert_eq!(row.payee_pubkey, None);
+            assert!(state.store.undelivered_events(10).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn sendpayment_without_hash_inserts_nothing() {
+            let server = MockServer::start().await;
+            let upstream =
+                br#"{"payment_id":"x","payment_hash":null,"payment_secret":null,"status":"Pending"}"#;
+            mount(&server, "/sendpayment", 200, upstream).await;
+            let (_, state, app) = harness(&server.uri()).await;
+
+            let req = post(
+                "/sendpayment",
+                json!({"invoice": "lni", "amt_msat": null, "asset_id": null, "asset_amount": null}),
+            );
+            let (status, body) = call(app, req).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, upstream);
+            assert!(payment_rows(&state).await.is_empty());
+        }
+
+        fn lninvoice_req() -> Request<Body> {
+            post(
+                "/lninvoice",
+                json!({
+                    "amt_msat": 3000000,
+                    "expiry_sec": 420,
+                    "asset_id": "rgb:asset",
+                    "asset_amount": 5
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn lninvoice_decodes_and_inserts_inbound_pending() {
+            let server = MockServer::start().await;
+            mount(&server, "/lninvoice", 200, br#"{"invoice":"lni"}"#).await;
+            let (rln, state, app) = harness(&server.uri()).await;
+            rln.add_invoice("lni", "cafe");
+
+            let (status, body) = call(app, lninvoice_req()).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, br#"{"invoice":"lni"}"#);
+            assert_eq!(rln.calls(), vec!["decode_ln_invoice:lni"]);
+            let rows = payment_rows(&state).await;
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.payment_hash, "cafe");
+            assert_eq!(row.direction, PaymentDirection::Inbound);
+            assert_eq!(row.status, PaymentStatus::Pending);
+            assert_eq!(row.amt_msat, Some(3000000));
+            assert_eq!(row.asset_id.as_deref(), Some("rgb:asset"));
+            assert_eq!(row.asset_amount, Some(5));
+            assert!(state.store.undelivered_events(10).await.unwrap().is_empty());
+            assert_eq!(state.engine.wake_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn lninvoice_decode_failure_leaves_response_untouched() {
+            let server = MockServer::start().await;
+            mount(&server, "/lninvoice", 200, br#"{"invoice":"lni"}"#).await;
+            let (rln, state, app) = harness(&server.uri()).await;
+
+            let (status, body) = call(app, lninvoice_req()).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, br#"{"invoice":"lni"}"#);
+            assert_eq!(rln.calls(), vec!["decode_ln_invoice:lni"]);
+            assert!(payment_rows(&state).await.is_empty());
+        }
     }
 
     #[tokio::test]
