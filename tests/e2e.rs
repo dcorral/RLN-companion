@@ -145,6 +145,120 @@ async fn expired_invoice_is_reaped() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn lightning_payment_webhooks() {
+    let mut e = setup().await;
+    fund(&e.r1).await;
+    fund(&e.r2).await;
+    let asset = e.r1.issue_nia("LNPAY", 1000).await;
+    let node2_pubkey = e.r2.node_pubkey().await;
+
+    e.r1.wait_height_synced().await;
+    e.r1.open_channel(
+        &format!("{node2_pubkey}@127.0.0.1:{}", peer2_port()),
+        100_000,
+        0,
+        &asset,
+        600,
+    )
+    .await;
+    let funding_txid = poll_some("funding tx in mempool", Duration::from_secs(60), || async {
+        let mempool = Bitcoind::mempool().await;
+        e.r1.list_channels()
+            .await
+            .iter()
+            .find(|c| c["asset_id"] == asset)
+            .and_then(|c| c["funding_txid"].as_str().map(str::to_string))
+            .filter(|txid| mempool.contains(txid))
+    })
+    .await;
+    Bitcoind::mine(6).await;
+    for (who, r) in [("opener", &e.r1), ("acceptor", &e.r2)] {
+        wait_until(
+            &format!("channel ready on {who}"),
+            Duration::from_secs(120),
+            || async {
+                r.list_channels()
+                    .await
+                    .iter()
+                    .any(|c| c["asset_id"] == asset && c["ready"] == true)
+            },
+        )
+        .await;
+    }
+
+    let funding = e
+        .sink1
+        .next_of("transfer.settled", Duration::from_secs(120))
+        .await
+        .expect("funding transfer.settled on opener");
+    assert_eq!(funding["transfer"]["kind"], "Send");
+    assert_eq!(funding["transfer"]["asset_id"], asset);
+    assert_eq!(funding["transfer"]["txid"], funding_txid.as_str());
+
+    // Well above HTLC_MIN_MSAT so node2 can pay the invoice back over the channel
+    // while keeping its 1%-of-capacity reserve.
+    let ks_hash = e.r1.keysend(&node2_pubkey, 10_000_000, &asset, 10).await;
+    let out = e
+        .sink1
+        .next_of("payment.settled", Duration::from_secs(120))
+        .await
+        .expect("outbound keysend payment.settled");
+    assert_eq!(out["payment"]["payment_hash"], ks_hash);
+    assert_eq!(out["payment"]["direction"], "Outbound");
+    assert_eq!(out["payment"]["asset_amount"], 10);
+    let inbound = e
+        .sink2
+        .next_of("payment.settled", Duration::from_secs(120))
+        .await
+        .expect("inbound keysend payment.settled");
+    assert_eq!(inbound["payment"]["payment_hash"], ks_hash);
+    assert_eq!(inbound["payment"]["direction"], "Inbound");
+    assert_eq!(inbound["payment"]["asset_amount"], 10);
+
+    let invoice = e.r1.ln_invoice(3_000_000, &asset, 5, 900).await;
+    let pending = poll_some(
+        "pre-tracked inbound payment row",
+        Duration::from_secs(10),
+        || async {
+            e.r1.companion_payments().await.into_iter().find(|p| {
+                p["status"] == "Pending" && p["direction"] == "Inbound" && p["asset_amount"] == 5
+            })
+        },
+    )
+    .await;
+    let pay_hash = e.r2.send_payment(&invoice).await;
+    assert_eq!(pending["payment_hash"], pay_hash);
+    let inbound = e
+        .sink1
+        .next_of("payment.settled", Duration::from_secs(120))
+        .await
+        .expect("inbound invoice payment.settled");
+    assert_eq!(inbound["payment"]["payment_hash"], pay_hash);
+    assert_eq!(inbound["payment"]["direction"], "Inbound");
+    assert_eq!(inbound["payment"]["asset_amount"], 5);
+    let out = e
+        .sink2
+        .next_of("payment.settled", Duration::from_secs(120))
+        .await
+        .expect("outbound invoice payment.settled");
+    assert_eq!(out["payment"]["payment_hash"], pay_hash);
+    assert_eq!(out["payment"]["direction"], "Outbound");
+
+    for r in [&e.r1, &e.r2] {
+        wait_until(
+            "pending_payments drained",
+            Duration::from_secs(30),
+            || async {
+                let h = r.health().await;
+                h["pending_payments"] == 0 && h["status"] == "ok"
+            },
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn companion_started_against_locked_node_recovers() {
     let e = setup().await;
     let (asset, rid, _) = issue_and_invoice(&e).await;

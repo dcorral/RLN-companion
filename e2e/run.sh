@@ -8,8 +8,8 @@ export E2E_ELECTRS_PORT="${E2E_ELECTRS_PORT:-50001}"
 export E2E_PROXY_PORT="${E2E_PROXY_PORT:-3000}"
 NODE1_PORT="${E2E_NODE1_PORT:-3001}"
 NODE2_PORT="${E2E_NODE2_PORT:-3002}"
-PEER1_PORT="${E2E_PEER1_PORT:-9801}"
-PEER2_PORT="${E2E_PEER2_PORT:-9802}"
+export E2E_PEER1_PORT="${E2E_PEER1_PORT:-9801}"
+export E2E_PEER2_PORT="${E2E_PEER2_PORT:-9802}"
 
 COMPOSE="docker compose -f e2e/compose.yaml"
 BITCOIN_CLI="$COMPOSE exec -T -u blits bitcoind bitcoin-cli -regtest"
@@ -65,8 +65,8 @@ $COMPOSE up -d
 wait_for electrs $TIMEOUT electrs_ready
 wait_for proxy $TIMEOUT proxy_ready
 
-start_node 1 "$NODE1_PORT" "$PEER1_PORT"
-start_node 2 "$NODE2_PORT" "$PEER2_PORT"
+start_node 1 "$NODE1_PORT" "$E2E_PEER1_PORT"
+start_node 2 "$NODE2_PORT" "$E2E_PEER2_PORT"
 export E2E_RLN1="http://127.0.0.1:$NODE1_PORT" E2E_RLN2="http://127.0.0.1:$NODE2_PORT"
 export E2E_INDEXER="127.0.0.1:$E2E_ELECTRS_PORT"
 export E2E_PROXY="rpc://127.0.0.1:$E2E_PROXY_PORT/json-rpc"

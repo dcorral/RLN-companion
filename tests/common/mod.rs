@@ -106,7 +106,9 @@ impl Companion {
         cfg.engine.reap_interval_secs = 2;
         cfg.engine.reconcile_backoff_secs = 1;
         cfg.engine.reconcile_max_wait_secs = 180;
-        cfg.sync.full_interval_secs = 30;
+        cfg.engine.payments_poll_interval_secs = 1;
+        // Short enough to observe a channel funding transfer while it is still pending.
+        cfg.sync.full_interval_secs = 5;
         extra(&mut cfg);
         cfg.validate().unwrap();
 
@@ -213,8 +215,8 @@ impl WebhookSink {
                 return Some(ev);
             }
             eprintln!(
-                "skipping event {} ({})",
-                ev["event_type"], ev["transfer"]["id"]
+                "skipping event {} ({} {})",
+                ev["event_type"], ev["transfer"]["id"], ev["payment"]["payment_hash"]
             );
         }
     }
@@ -434,6 +436,121 @@ impl Rln {
             .clone()
     }
 
+    pub async fn node_pubkey(&self) -> String {
+        self.get("/nodeinfo").await["pubkey"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    pub async fn wait_height_synced(&self) {
+        let target = Bitcoind::block_count().await;
+        wait_until(
+            "node height at chain tip",
+            Duration::from_secs(30),
+            || async { self.get("/networkinfo").await["height"].as_u64() >= Some(target) },
+        )
+        .await;
+    }
+
+    // RLN test defaults: public, anchors, no custom fees; 403 (opening in progress) retried.
+    pub async fn open_channel(
+        &self,
+        peer_pubkey_and_opt_addr: &str,
+        capacity_sat: u64,
+        push_msat: u64,
+        asset_id: &str,
+        asset_amount: u64,
+    ) {
+        let body = json!({
+            "peer_pubkey_and_opt_addr": peer_pubkey_and_opt_addr,
+            "capacity_sat": capacity_sat,
+            "push_msat": push_msat,
+            "asset_amount": asset_amount,
+            "asset_id": asset_id,
+            "push_asset_amount": null,
+            "public": true,
+            "with_anchors": true,
+            "fee_base_msat": null,
+            "fee_proportional_millionths": null,
+            "temporary_channel_id": null,
+            "virtual_open_mode": null
+        });
+        retry("openchannel", Duration::from_secs(90), || {
+            self.try_post("/openchannel", Some(body.clone()))
+        })
+        .await;
+    }
+
+    pub async fn list_channels(&self) -> Vec<Value> {
+        self.get("/listchannels").await["channels"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    pub async fn keysend(
+        &self,
+        dest_pubkey: &str,
+        amt_msat: u64,
+        asset_id: &str,
+        asset_amount: u64,
+    ) -> String {
+        let body = json!({
+            "dest_pubkey": dest_pubkey,
+            "amt_msat": amt_msat,
+            "asset_id": asset_id,
+            "asset_amount": asset_amount
+        });
+        self.post("/keysend", body).await["payment_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    pub async fn ln_invoice(
+        &self,
+        amt_msat: u64,
+        asset_id: &str,
+        asset_amount: u64,
+        expiry_sec: u32,
+    ) -> String {
+        let body = json!({
+            "amt_msat": amt_msat,
+            "expiry_sec": expiry_sec,
+            "asset_id": asset_id,
+            "asset_amount": asset_amount,
+            "payment_hash": null,
+            "description": null,
+            "description_hash": null,
+            "min_final_cltv_expiry_delta": null
+        });
+        self.post("/lninvoice", body).await["invoice"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    pub async fn send_payment(&self, invoice: &str) -> String {
+        let body = json!({
+            "invoice": invoice,
+            "amt_msat": null,
+            "asset_id": null,
+            "asset_amount": null
+        });
+        self.post("/sendpayment", body).await["payment_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    pub async fn companion_payments(&self) -> Vec<Value> {
+        self.get("/companion/payments").await["payments"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
     pub async fn wait_synced(&self, timeout: Duration) {
         wait_until("companion unlocked and synced", timeout, || async {
             let h = self.health().await;
@@ -540,4 +657,23 @@ pub async fn fund(rln: &Rln) {
     })
     .await;
     Bitcoind::mine(1).await;
+}
+
+pub fn peer2_port() -> String {
+    std::env::var("E2E_PEER2_PORT").unwrap_or_else(|_| "9802".into())
+}
+
+pub async fn poll_some<T, F, Fut>(what: &str, timeout: Duration, mut op: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = op().await {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out polling for {what}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

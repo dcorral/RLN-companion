@@ -10,7 +10,7 @@
 
 Host ports can be moved with `E2E_BITCOIND_PORT`, `E2E_ELECTRS_PORT`, `E2E_PROXY_PORT`, `E2E_NODE1_PORT`, `E2E_NODE2_PORT`, `E2E_PEER1_PORT` and `E2E_PEER2_PORT`. Use `127.0.0.1` everywhere; RLN's e2e is known to break on `localhost` resolving to `::1`.
 
-The harness only talks to the companions (one direct RLN call exists, in the parity test, by design). The five scenarios prove:
+The harness only talks to the companions (one direct RLN call exists, in the parity test, by design). The six scenarios prove:
 
 | Scenario | Proves |
 | --- | --- |
@@ -18,6 +18,7 @@ The harness only talks to the companions (one direct RLN call exists, in the par
 | `non_donation_send_is_broadcast_by_sender_companion` | A non-donation send is not broadcast by `/sendrgb` itself; the sender's companion drives `/refreshtransfers` until the transaction appears in the mempool, and both sides settle after mining |
 | `expired_invoice_is_reaped` | An invoice whose expiration passes is failed by the reaper through `/failtransfers` and produces `transfer.failed` |
 | `companion_started_against_locked_node_recovers` | A companion started against a locked node reports `locked`/`degraded`, reconciles after `/unlock` through it, reports `ok`, and settles a transfer created before it existed |
+| `lightning_payment_webhooks` | A colored channel opened through the companion settles its funding transfer with webhooks; an RGB keysend and an LN invoice paid back over it produce `payment.settled` in both directions on both companions, `/lninvoice` pre-tracks the inbound row as `Pending` before it is paid, and `pending_payments` drains to 0 |
 | `pass_through_parity` | `/nodeinfo`, `/listassets`, `/btcbalance` and `/listunspents` return byte-identical bodies through the companion and directly from RLN |
 
 ## CI
