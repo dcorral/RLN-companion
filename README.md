@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> This project moved to [UTEXO-Protocol/RTR](https://github.com/UTEXO-Protocol/RTR), renamed to Ride The RLN (RTR). This repository is no longer updated.
+
 # rln-companion
 
 A sidecar that sits in front of your RGB Lightning Node (RLN). You talk to the companion instead of the node: same API, same paths, same payloads. The companion watches what goes through, keeps the node's transfers moving, and calls you back when something settles or fails.
